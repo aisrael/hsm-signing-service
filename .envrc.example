@@ -1,0 +1,11 @@
+# Local workstation (macOS / Homebrew) specifics
+export PKCS11_MODULE="/opt/homebrew/opt/softhsm/lib/softhsm/libsofthsm2.so"
+
+# The PINs to use for the token and keys. Remember to change these in a real application.
+export HSM_SO_PIN="change-me"
+export HSM_PIN="change-me-too"
+
+# The label to use for the token and keys. You can change this label, but use
+# only alphanumeric characters (a-z, A-Z, 0-9). Other characters, such as ".",
+# can break the label checks in setup.sh.
+export KEY_LABEL="example"
