@@ -65,3 +65,24 @@ async fn main() {
 
     axum::serve(listener, app).await.expect("server error");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn handle_post_sign_echoes_the_payload() {
+        let request = SignRequest {
+            key_id: "example".to_string(),
+            algorithm: Algorithm::EcdsaP256Sha256,
+            payload: "aGVsbG8gd29ybGQ=".to_string(), // "hello world"
+        };
+
+        let Json(response) = handle_post_sign(Json(request)).await;
+
+        assert_eq!(response.key_id, "example");
+        assert_eq!(response.algorithm, Algorithm::EcdsaP256Sha256);
+        // For now, the handler echoes the payload as the signature.
+        assert_eq!(response.signature, "aGVsbG8gd29ybGQ=");
+    }
+}
