@@ -44,6 +44,11 @@ async fn handle_post_sign(Json(request): Json<SignRequest>) -> Json<SignResponse
 
 #[tokio::main]
 async fn main() {
+    let hsm_signing_service_host =
+        std::env::var("HSM_SIGNING_SERVICE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let hsm_signing_service_port =
+        std::env::var("HSM_SIGNING_SERVICE_PORT").unwrap_or_else(|_| "8080".into());
+
     println!("hsm-signing-service version {CRATE_VERSION} starting...");
 
     tracing_subscriber::fmt()
@@ -54,8 +59,8 @@ async fn main() {
 
     let app = Router::new().route("/v1/sign", post(handle_post_sign));
 
-    let addr = "127.0.0.1:8080";
-    let listener = TcpListener::bind(addr).await.expect("failed to bind");
+    let addr = format!("{hsm_signing_service_host}:{hsm_signing_service_port}");
+    let listener = TcpListener::bind(&addr).await.expect("failed to bind");
     tracing::info!("listening on {addr}");
 
     axum::serve(listener, app).await.expect("server error");
