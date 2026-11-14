@@ -1,6 +1,14 @@
+//! A simple HTTP service that signs payloads using a hardware security module (HSM).
+
+use std::fmt::Write;
+
 use axum::Json;
 use axum::Router;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::post;
+use base64::Engine;
+use base64::engine::GeneralPurpose;
 use clap::crate_version;
 use serde::Deserialize;
 use serde::Serialize;
@@ -33,13 +41,54 @@ pub struct SignResponse {
     pub duration_ms: u64,
 }
 
-async fn handle_post_sign(Json(request): Json<SignRequest>) -> Json<SignResponse> {
-    Json(SignResponse {
+/// The body of every error response.
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+/// Errors that the API returns to the client.
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    /// The `payload` field is not valid base64.
+    #[error("Unable to base64 decode payload: {0}")]
+    PayloadBase64DecodingError(#[from] base64::DecodeError),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let error_body = ErrorResponse {
+            error: self.to_string(),
+        };
+        (StatusCode::BAD_REQUEST, Json(error_body)).into_response()
+    }
+}
+
+/// Just an alias for the base64 engine we use to decode the payload.
+const BASE64: GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        write!(&mut s, "{:02x}", b).unwrap();
+    }
+    s
+}
+
+async fn handle_post_sign(
+    Json(request): Json<SignRequest>,
+) -> Result<Json<SignResponse>, ApiError> {
+    // Validate that the payload is valid base64.
+    let decoded_payload = BASE64.decode(&request.payload)?;
+    // For now, we just return the payload in hex as the signature.
+    let signature = encode_hex(&decoded_payload);
+    let response = SignResponse {
         key_id: request.key_id,
         algorithm: request.algorithm,
-        signature: request.payload, // For now, just echo the payload as the signature.
+        signature: signature,
         duration_ms: 1,
-    })
+    };
+    Ok(Json(response))
 }
 
 #[tokio::main]
@@ -78,11 +127,31 @@ mod tests {
             payload: "aGVsbG8gd29ybGQ=".to_string(), // "hello world"
         };
 
-        let Json(response) = handle_post_sign(Json(request)).await;
+        let Json(response) = handle_post_sign(Json(request))
+            .await
+            .expect("Expected Ok(Json(SignResponse))");
 
         assert_eq!(response.key_id, "example");
         assert_eq!(response.algorithm, Algorithm::EcdsaP256Sha256);
         // For now, the handler echoes the payload as the signature.
-        assert_eq!(response.signature, "aGVsbG8gd29ybGQ=");
+        assert_eq!(response.signature, "68656c6c6f20776f726c64");
+    }
+
+    #[tokio::test]
+    async fn handle_post_sign_invalid_base64_payload() {
+        let request = SignRequest {
+            key_id: "example".to_string(),
+            algorithm: Algorithm::EcdsaP256Sha256,
+            payload: "invalid_base64".to_string(),
+        };
+
+        let result = handle_post_sign(Json(request)).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ApiError::PayloadBase64DecodingError(_)),
+            "Expected PayloadBase64DecodingError, got {err:?}"
+        );
     }
 }

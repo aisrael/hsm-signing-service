@@ -101,7 +101,7 @@ fn post_sign_echoes_the_payload() {
     assert_eq!(body["key_id"], "example");
     assert_eq!(body["algorithm"], "ECDSA_P256_SHA256");
     // For now, the service echoes the payload as the signature.
-    assert_eq!(body["signature"], request["payload"]);
+    assert_eq!(body["signature"], "68656c6c6f20776f726c64");
     assert!(
         body["duration_ms"].is_u64(),
         "duration_ms is not a non-negative integer: {}",
