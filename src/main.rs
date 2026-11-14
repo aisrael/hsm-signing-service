@@ -1,12 +1,45 @@
+use axum::Json;
 use axum::Router;
 use axum::routing::post;
 use clap::crate_version;
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::net::TcpListener;
 
 const CRATE_VERSION: &str = crate_version!();
 
-async fn handle_post_sign() {
-    tracing::trace!("POST /v1/sign");
+/// The algorithm to use for signing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Algorithm {
+    #[serde(rename = "ECDSA_P256_SHA256")]
+    EcdsaP256Sha256,
+}
+
+/// The request body for the POST /v1/sign endpoint.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignRequest {
+    pub key_id: String,
+    pub algorithm: Algorithm,
+    pub payload: String,
+}
+
+/// The response body for the POST /v1/sign endpoint.
+#[derive(Debug, Serialize)]
+pub struct SignResponse {
+    pub key_id: String,
+    pub algorithm: Algorithm,
+    pub signature: String,
+    pub duration_ms: u64,
+}
+
+async fn handle_post_sign(Json(request): Json<SignRequest>) -> Json<SignResponse> {
+    Json(SignResponse {
+        key_id: request.key_id,
+        algorithm: request.algorithm,
+        signature: request.payload, // For now, just echo the payload as the signature.
+        duration_ms: 1,
+    })
 }
 
 #[tokio::main]
