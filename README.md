@@ -27,13 +27,13 @@ sh ./setup.sh
 
 ## Usage
 
-The program has three commands: `server`, `encrypt` and `decrypt`. If you give no command, the program runs `server`.
+The program has four commands: `server`, `encrypt`, `decrypt` and `wrap`. If you give no command, the program runs `server`.
 
 ```sh
 cargo run -- --help
 ```
 
-Both commands read their settings from environment variables.
+All commands read their settings from environment variables.
 
 | Variable | Required | Description |
 | --- | --- | --- |
@@ -42,8 +42,8 @@ Both commands read their settings from environment variables.
 | `PKCS11_MODULE` | No | The path to the PKCS#11 library. The default is the Homebrew SoftHSM library. |
 | `HSM_SIGNING_SERVICE_HOST` | No | The address to listen on. The default is `127.0.0.1`. |
 | `HSM_SIGNING_SERVICE_PORT` | No | The port to listen on. The default is `8080`. |
-
-The program never prints the PIN.
+| `AES_KEY_LABEL` | Setup only | The label of the AES-256 key. `setup.sh` creates it. |
+| `EXPORTABLE_KEY_LABEL` | Setup only | The label of the EC P-256 key pair that `wrap` wraps. `setup.sh` creates it. |
 
 ### `server`
 
@@ -84,7 +84,9 @@ Error responses have the body `{"error": "..."}`:
 
 ### `encrypt`
 
-Encrypts data with AES-256-GCM inside the HSM. The command reads the plaintext from STDIN and prints the result to STDOUT as base64. The `--key-id` option is required. It is the label of an AES key in the token. `setup.sh` creates the key `example-aes`.
+Encrypts data with AES-256-GCM inside the HSM. The command reads the plaintext from STDIN and prints the result to STDOUT as base64.
+
+The `--key-id` argument is required. It is the label of an AES key in the token.
 
 ```sh
 printf 'hello world' | cargo run -- encrypt --key-id example-aes
@@ -102,7 +104,9 @@ If the command fails, it prints an error to STDERR and exits with code 1. STDOUT
 
 ### `decrypt`
 
-Decrypts the output of `encrypt` inside the HSM. The command reads the base64 text from STDIN and writes the plaintext to STDOUT. The `--key-id` option is required. It must be the label of the AES key that `encrypt` used.
+Decrypts the output of `encrypt` inside the HSM. The command reads the base64 text from STDIN and writes the plaintext to STDOUT.
+
+The `--key-id` argument is required. It must be the label of the AES key that `encrypt` used.
 
 ```sh
 printf 'hello world' | cargo run -- encrypt --key-id example-aes | cargo run -- decrypt --key-id example-aes
@@ -111,5 +115,26 @@ printf 'hello world' | cargo run -- encrypt --key-id example-aes | cargo run -- 
 The command ignores spaces and newlines around the input. It writes the plaintext bytes exactly as they were. It does not add a newline.
 
 AES-GCM checks the tag. The command fails if you use the wrong key or if someone changed the data. It also fails if the input is not valid base64 or is shorter than 28 bytes (the IV and the tag).
+
+If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.
+
+### `wrap`
+
+Encrypts an EC private key with an AES key inside the HSM (AES key wrap with padding, `CKM_AES_KEY_WRAP_PAD`). The command prints the encrypted key to STDOUT as base64.
+
+The following arguments are required:
+
+- `--key-id`: the label of the AES key that wraps. `setup.sh` creates the key `example-aes`.
+- `--target-key-id`: the label of the EC private key to wrap. `setup.sh` creates the key `example-exportable` for this purpose.
+
+```sh
+cargo run -- wrap --key-id example-aes --target-key-id example-exportable
+```
+
+The output is the private key (PKCS#8) encrypted under the AES key. It is safe to store, because only an HSM that has the same AES key can decrypt it. The AES key and the plain private key never leave the HSM. The command gives the same output each time, because AES key wrap uses no IV.
+
+The HSM wraps only a key that is extractable. `setup.sh` makes only `example-exportable` extractable (and sensitive), and it fails if any other key in the token is extractable. The signing key stays non-extractable, so `wrap` fails for it. This is on purpose. `example-exportable` exists to demonstrate the command.
+
+`wrap` supports EC private keys only. The program has no `unwrap` command.
 
 If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.
