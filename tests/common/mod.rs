@@ -9,9 +9,17 @@
 #![allow(dead_code)]
 
 use std::io::Write;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::process::Child;
 use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
+use std::thread::sleep;
+use std::time::Duration;
+use std::time::Instant;
+
+const ADDR: &str = "127.0.0.1";
 
 /// Read a required environment variable.
 pub fn env_var(name: &str) -> String {
@@ -62,4 +70,60 @@ pub fn assert_failed(output: &Output) -> String {
         "the error message shows the PIN"
     );
     stderr
+}
+
+/// Ask the operating system for a port that no process uses now.
+fn free_port() -> u16 {
+    TcpListener::bind((ADDR, 0))
+        .expect("failed to find a free port")
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A running service. The process stops when this value is dropped.
+pub struct Service {
+    pub child: Child,
+    addr: String,
+}
+
+impl Service {
+    /// Start the service on a free port and wait until it accepts connections.
+    pub fn start() -> Self {
+        let port = free_port();
+        let addr = format!("{ADDR}:{port}");
+
+        // Set both variables, so values from the developer's shell (for
+        // example, from `.envrc`) cannot change the address.
+        let child = Command::new(env!("CARGO_BIN_EXE_hsm-signing-service"))
+            .env("HSM_SIGNING_SERVICE_HOST", ADDR)
+            .env("HSM_SIGNING_SERVICE_PORT", port.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to start the service");
+        let service = Service { child, addr };
+
+        // Wait until the service accepts connections.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect(&service.addr).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the service did not start within 10 seconds"
+            );
+            sleep(Duration::from_millis(50));
+        }
+        service
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
