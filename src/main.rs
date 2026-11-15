@@ -11,6 +11,8 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use base64::Engine;
 use base64::engine::GeneralPurpose;
+use clap::Parser;
+use clap::Subcommand;
 use clap::crate_version;
 use serde::Deserialize;
 use serde::Serialize;
@@ -142,8 +144,31 @@ where
     Ok(Json(response))
 }
 
+/// Command line arguments
+#[derive(Debug, Parser)]
+#[command(version)]
+struct Cli {
+    /// The command to run. The default is `server`.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run the HTTP signing service.
+    Server,
+}
+
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Command::Server) {
+        Command::Server => run_server().await,
+    }
+}
+
+/// Run the HTTP signing service until the process stops.
+async fn run_server() {
     println!("hsm-signing-service version {CRATE_VERSION} starting...");
 
     let config = Config::try_from_env().unwrap_or_else(|err| {
