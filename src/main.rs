@@ -1,5 +1,6 @@
 //! A simple HTTP service that signs payloads using a hardware security module (HSM).
 
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -157,6 +158,13 @@ struct Cli {
 enum Command {
     /// Run the HTTP signing service.
     Server,
+    /// Encrypt STDIN with AES-GCM inside the HSM. Print the result to STDOUT
+    /// as base64 of `iv || ciphertext || tag`.
+    Encrypt {
+        /// The label of the AES key in the token.
+        #[arg(long)]
+        key_id: String,
+    },
 }
 
 #[tokio::main]
@@ -164,7 +172,37 @@ async fn main() {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Server) {
         Command::Server => run_server().await,
+        Command::Encrypt { key_id } => run_encrypt(&key_id),
     }
+}
+
+/// Read STDIN, encrypt it with the AES key `key_id` and print base64 to STDOUT.
+/// Errors go to STDERR and the process exits with code 1.
+fn run_encrypt(key_id: &str) {
+    let config = Config::try_from_env().unwrap_or_else(|err| {
+        eprintln!("Error loading configuration: {err}");
+        std::process::exit(1);
+    });
+
+    let mut plaintext = Vec::new();
+    if let Err(err) = std::io::stdin().read_to_end(&mut plaintext) {
+        eprintln!("Error reading STDIN: {err}");
+        std::process::exit(1);
+    }
+
+    let hsm_backend = hsm_backend::CryptokiBackend::try_new(&config).unwrap_or_else(|err| {
+        eprintln!("Error initializing HSM backend: {err}");
+        std::process::exit(1);
+    });
+
+    let encrypted = hsm_backend
+        .encrypt(key_id, &plaintext)
+        .unwrap_or_else(|err| {
+            eprintln!("Error encrypting: {err}");
+            std::process::exit(1);
+        });
+
+    println!("{}", BASE64.encode(encrypted));
 }
 
 /// Run the HTTP signing service until the process stops.
