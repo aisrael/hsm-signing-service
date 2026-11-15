@@ -1,8 +1,7 @@
 //! A simple HTTP service that signs payloads using a hardware security module (HSM).
 
-use std::fmt::Debug;
-use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
 use axum::Router;
@@ -69,49 +68,57 @@ pub enum ApiError {
     /// The `payload` field is not valid base64.
     #[error("Unable to base64 decode payload: {0}")]
     PayloadBase64DecodingError(#[from] base64::DecodeError),
+    /// Something failed inside the service. The cause is logged, not sent.
+    #[error("Internal error")]
+    Internal(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        let status = match &self {
+            ApiError::PayloadBase64DecodingError(_) => StatusCode::BAD_REQUEST,
+            ApiError::Internal(cause) => {
+                tracing::error!("internal error: {cause}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        };
         let error_body = ErrorResponse {
             error: self.to_string(),
         };
-        (StatusCode::BAD_REQUEST, Json(error_body)).into_response()
+        (status, Json(error_body)).into_response()
     }
 }
 
 /// Just an alias for the base64 engine we use to decode the payload.
 const BASE64: GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        write!(&mut s, "{:02x}", b).unwrap();
-    }
-    s
-}
-
-#[instrument(skip(request))]
+#[instrument(skip(state, request))]
 async fn handle_post_sign<B>(
-    State(app_state): State<Arc<AppState<B>>>,
+    State(state): State<Arc<AppState<B>>>,
     Json(request): Json<SignRequest>,
 ) -> Result<Json<SignResponse>, ApiError>
 where
-    B: HsmBackend + Debug,
+    B: HsmBackend,
 {
     trace!("POST /v1/sign");
-    let state = app_state.clone();
-    let key_id = request.key_id.clone();
-
-    // Validate that the payload is valid base64.
+    let start = Instant::now();
     let decoded_payload = BASE64.decode(&request.payload)?;
-    // For now, we just return the payload in hex as the signature.
-    let signature = encode_hex(&decoded_payload);
+
+    // `spawn_blocking` needs a `'static` closure, so it gets its own copies.
+    let backend_state = Arc::clone(&state);
+    let key_id = request.key_id.clone();
+    let signature = tokio::task::spawn_blocking(move || {
+        backend_state.hsm_backend.sign(&key_id, &decoded_payload)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .map_err(ApiError::Internal)?;
+
     let response = SignResponse {
         key_id: request.key_id,
         algorithm: request.algorithm,
-        signature: signature,
-        duration_ms: 1,
+        signature: BASE64.encode(signature),
+        duration_ms: start.elapsed().as_millis() as u64,
     };
     Ok(Json(response))
 }
@@ -187,8 +194,8 @@ mod tests {
 
         assert_eq!(response.key_id, "example");
         assert_eq!(response.algorithm, Algorithm::EcdsaP256Sha256);
-        // For now, the handler echoes the payload as the signature.
-        assert_eq!(response.signature, "68656c6c6f20776f726c64");
+        // The mock returns the payload as the signature.
+        assert_eq!(response.signature, "aGVsbG8gd29ybGQ=");
     }
 
     #[tokio::test]

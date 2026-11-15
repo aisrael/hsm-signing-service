@@ -37,7 +37,7 @@ pub enum HsmBackendError {
 }
 
 #[cfg_attr(test, mockall::automock)]
-pub trait HsmBackend {
+pub trait HsmBackend: Send + Sync + 'static {
     /// Sign the given payload using the specified key.
     fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, String>;
 
