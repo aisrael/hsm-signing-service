@@ -23,6 +23,7 @@ pub enum ConfigError {
     Pkcs11ModuleNotFound(String),
 }
 
+#[derive(Debug)]
 pub struct Config {
     /// The host (address) to bind the service to.
     host: String,
@@ -233,5 +234,19 @@ mod tests {
                 "CONFIG_TEST_DEFAULT_NOT_UNICODE"
             ))
         ));
+    }
+
+    #[test]
+    fn debug_output_does_not_show_the_pin() {
+        let pin = "pin-that-must-stay-secret";
+        let config = Config::for_test("example", pin);
+
+        // The compact and the pretty-printed form both use `Debug`.
+        for output in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!output.contains(pin), "Debug shows the PIN: {output}");
+            assert!(output.contains("REDACTED"), "unexpected: {output}");
+            // The other fields are still visible, so the output is useful.
+            assert!(output.contains("example"), "unexpected: {output}");
+        }
     }
 }
