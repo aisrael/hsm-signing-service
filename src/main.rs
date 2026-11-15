@@ -20,6 +20,7 @@ use tracing_subscriber::fmt::format::FmtSpan;
 mod app_state;
 mod config;
 mod errors;
+mod hsm_backend;
 
 use app_state::AppState;
 use config::Config;
@@ -111,7 +112,13 @@ async fn main() {
         eprintln!("Error loading configuration: {err}");
         std::process::exit(1);
     });
-    let app_state = AppState::try_new(&config).unwrap_or_else(|err| {
+
+    let hsm_backend = hsm_backend::SoftHsm2Backend::try_new(&config).unwrap_or_else(|err| {
+        eprintln!("Error initializing HSM backend: {err}");
+        std::process::exit(1);
+    });
+
+    let app_state = AppState::try_new(&config, hsm_backend).unwrap_or_else(|err| {
         eprintln!("Error initializing application state: {err}");
         std::process::exit(1);
     });
