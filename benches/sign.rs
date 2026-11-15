@@ -43,7 +43,7 @@ struct Args {
 }
 
 /// The results of one phase.
-struct Phase {
+struct PhaseResults {
     /// The latencies of the successful requests.
     latencies: Vec<Duration>,
     total_requests: u64,
@@ -52,7 +52,7 @@ struct Phase {
     elapsed: Duration,
 }
 
-impl Phase {
+impl PhaseResults {
     /// The latencies of the successful requests in milliseconds, from the
     /// smallest to the largest.
     fn latencies_ms(&self) -> Vec<f64> {
@@ -82,7 +82,7 @@ fn sign_once(agent: &ureq::Agent, url: &str, request: &Value) -> Option<Duration
 }
 
 /// Send requests one after another until `duration` has passed.
-fn run_phase(agent: &ureq::Agent, url: &str, request: &Value, duration: Duration) -> Phase {
+fn run_phase(agent: &ureq::Agent, url: &str, request: &Value, duration: Duration) -> PhaseResults {
     let start = Instant::now();
     let mut latencies = Vec::new();
     let mut total_requests = 0;
@@ -94,7 +94,7 @@ fn run_phase(agent: &ureq::Agent, url: &str, request: &Value, duration: Duration
             None => failed_requests += 1,
         }
     }
-    Phase {
+    PhaseResults {
         latencies,
         total_requests,
         failed_requests,
@@ -110,8 +110,8 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 /// Print the report for the measured phase.
-fn report(phase: &Phase) {
-    let Phase {
+fn report(phase: &PhaseResults) {
+    let PhaseResults {
         total_requests,
         failed_requests,
         elapsed,

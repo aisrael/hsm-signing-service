@@ -69,7 +69,13 @@ fn verify_rejects_another_payload() {
 #[test]
 fn verify_rejects_a_signature_that_is_not_base64() {
     let output = run(
-        &["verify", "--key-id", "example", "--signature", "not base64!"],
+        &[
+            "verify",
+            "--key-id",
+            "example",
+            "--signature",
+            "not base64!",
+        ],
         PAYLOAD,
     );
 
