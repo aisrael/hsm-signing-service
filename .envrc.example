@@ -15,6 +15,12 @@ export HSM_TOKEN_LABEL="example"
 # the token label, plus "-".
 export AES_KEY_LABEL="example-aes"
 
+# The label of the exportable EC P-256 key pair. `setup.sh` creates it. Its
+# private key is extractable, so the `wrap` command can wrap it with the AES
+# key. It is still sensitive, so its value never leaves the HSM in plain form.
+# Use the same characters as for the AES key label.
+export EXPORTABLE_KEY_LABEL="example-exportable"
+
 # The service address and port to bind to
 export HSM_SIGNING_SERVICE_HOST="127.0.0.1"
 export HSM_SIGNING_SERVICE_PORT="8080"

@@ -15,6 +15,11 @@ if [ -z "$AES_KEY_LABEL" ]; then
     exit 1
 fi
 
+if [ -z "$EXPORTABLE_KEY_LABEL" ]; then
+    echo "Error: EXPORTABLE_KEY_LABEL is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
+    exit 1
+fi
+
 if [ -z "$HSM_SO_PIN" ]; then
     echo "Error: HSM_SO_PIN is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
     exit 1
@@ -69,6 +74,22 @@ has_object() {
     pkcs11 --list-objects "$@" | grep -q -E 'label:[[:space:]]+'"$label"'[[:space:]]*$'
 }
 
+# Succeeds if the keys of the type in the first argument (`privkey` or
+# `secrkey`) have the right settings. Every key must be `never extractable`,
+# except the exportable key. That key must be extractable and sensitive.
+check_extractable() {
+    pkcs11 --list-objects --type "$1" | awk -v exportable="$EXPORTABLE_KEY_LABEL" '
+        /^[[:space:]]+label:/ { label = $2 }
+        /^[[:space:]]+Access:/ {
+            if (label == exportable) {
+                if ($0 ~ /never extractable/ || $0 !~ /sensitive/) { bad = 1 }
+            } else if ($0 !~ /never extractable/) {
+                bad = 1
+            }
+        }
+        END { exit bad }'
+}
+
 ################################################################################
 # Create the token and keys if they don't already exist.
 
@@ -98,8 +119,21 @@ else
     pkcs11 --keygen --key-type aes:32 --id 02 --label "$AES_KEY_LABEL" --sensitive --usage-decrypt
 fi
 
-# No secret key in the token may be extractable.
-if pkcs11 --list-objects --type secrkey | grep 'Access:' | grep -v -q 'never extractable'; then
-    echo "Error: a secret key in the token is extractable." >&2
-    exit 1
+################################################################################
+# Create the exportable EC key pair if it doesn't already exist.
+
+if has_object "$EXPORTABLE_KEY_LABEL" privkey; then
+    echo "Exportable key already generated. Skipping."
+else
+    echo "Generating the exportable EC key pair..."
+    pkcs11 --keypairgen --key-type EC:prime256v1 --id 03 --label "$EXPORTABLE_KEY_LABEL" \
+        --usage-sign --sensitive --extractable
 fi
+
+# No other key in the token may be extractable.
+for type in secrkey privkey; do
+    if ! check_extractable "$type"; then
+        echo "Error: a $type in the token has wrong settings. Only $EXPORTABLE_KEY_LABEL may be extractable, and it must be sensitive." >&2
+        exit 1
+    fi
+done
