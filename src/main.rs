@@ -93,13 +93,16 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 #[instrument(skip(request))]
 async fn handle_post_sign<B>(
-    State(state): State<Arc<AppState<B>>>,
+    State(app_state): State<Arc<AppState<B>>>,
     Json(request): Json<SignRequest>,
 ) -> Result<Json<SignResponse>, ApiError>
 where
     B: HsmBackend + Debug,
 {
     trace!("POST /v1/sign");
+    let state = app_state.clone();
+    let key_id = request.key_id.clone();
+
     // Validate that the payload is valid base64.
     let decoded_payload = BASE64.decode(&request.payload)?;
     // For now, we just return the payload in hex as the signature.
@@ -155,20 +158,11 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hsm_backend::MockHsmBackend;
 
-    /// A backend that needs no HSM. It returns the payload as the signature.
-    #[derive(Debug)]
-    struct MockBackend;
-
-    impl HsmBackend for MockBackend {
-        fn sign(&self, _key_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-            Ok(payload.to_vec())
-        }
-    }
-
-    fn mock_state() -> State<Arc<AppState<MockBackend>>> {
+    fn state_with(backend: MockHsmBackend) -> State<Arc<AppState<MockHsmBackend>>> {
         let config = Config::for_test("example", "0000");
-        let app_state = AppState::try_new(&config, MockBackend).expect("unable to build the state");
+        let app_state = AppState::try_new(&config, backend).expect("unable to build the state");
         State(Arc::new(app_state))
     }
 
@@ -180,7 +174,14 @@ mod tests {
             payload: "aGVsbG8gd29ybGQ=".to_string(), // "hello world"
         };
 
-        let Json(response) = handle_post_sign(mock_state(), Json(request))
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_sign()
+            .withf(|key_id, payload| key_id == "example" && payload == b"hello world")
+            .times(1)
+            .returning(|_, payload| Ok(payload.to_vec()));
+
+        let Json(response) = handle_post_sign(state_with(backend), Json(request))
             .await
             .expect("Expected Ok(Json(SignResponse))");
 
@@ -198,7 +199,11 @@ mod tests {
             payload: "invalid_base64".to_string(),
         };
 
-        let result = handle_post_sign(mock_state(), Json(request)).await;
+        // The payload is rejected before the backend is called.
+        let mut backend = MockHsmBackend::new();
+        backend.expect_sign().never();
+
+        let result = handle_post_sign(state_with(backend), Json(request)).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();

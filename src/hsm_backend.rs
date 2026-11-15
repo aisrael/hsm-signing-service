@@ -7,6 +7,9 @@ use cryptoki::context::CInitializeArgs;
 use cryptoki::context::CInitializeFlags;
 use cryptoki::context::Pkcs11;
 use cryptoki::error::Error as CryptokiError;
+use cryptoki::object::Attribute;
+use cryptoki::object::KeyType;
+use cryptoki::object::ObjectClass;
 use cryptoki::session::Session;
 use cryptoki::session::UserType;
 use cryptoki::slot::Slot;
@@ -29,11 +32,19 @@ pub enum HsmBackendError {
     OpenSession(#[source] CryptokiError),
     #[error("unable to log in to the token: {0}")]
     Login(#[source] CryptokiError),
+    #[error("unable to search for the key: {0}")]
+    FindKey(#[source] CryptokiError),
 }
 
+#[cfg_attr(test, mockall::automock)]
 pub trait HsmBackend {
     /// Sign the given payload using the specified key.
     fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, String>;
+
+    /// Check whether the token holds an EC private key with the label `key_id`.
+    ///
+    /// The caller must validate `key_id` first. This method blocks.
+    fn key_exists(&self, key_id: &str) -> Result<bool, HsmBackendError>;
 }
 
 /// Find the slot of the token that has the given label.
@@ -115,6 +126,21 @@ impl CryptokiBackend {
 }
 
 impl HsmBackend for CryptokiBackend {
+    fn key_exists(&self, key_id: &str) -> Result<bool, HsmBackendError> {
+        let template = [
+            Attribute::Class(ObjectClass::PRIVATE_KEY),
+            Attribute::KeyType(KeyType::EC),
+            Attribute::Label(key_id.as_bytes().to_vec()),
+        ];
+        // A poisoned lock only means that another request panicked. The
+        // session itself is still usable.
+        let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        let handles = session
+            .find_objects(&template)
+            .map_err(HsmBackendError::FindKey)?;
+        Ok(!handles.is_empty())
+    }
+
     fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
         // Here you would implement the actual signing logic using SoftHSM2.
         // For now, we just return the payload as the "signature".
@@ -129,6 +155,8 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::MutexGuard;
     use std::sync::OnceLock;
+
+    use cryptoki::mechanism::Mechanism;
 
     use super::*;
 
@@ -224,5 +252,58 @@ mod tests {
             error.to_string().contains("no token with the label"),
             "unexpected: {error}"
         );
+    }
+
+    /// Generate an EC P-256 key pair inside the test token. Run once per label.
+    fn generate_key_pair(label: &str) {
+        let config = Config::for_test(TOKEN_LABEL, PIN);
+        let pkcs11 = load_pkcs11(&config).expect("unable to load the module");
+        let slot = find_token_by_label(pkcs11, TOKEN_LABEL).expect("token not found");
+        let session = pkcs11
+            .open_rw_session(slot)
+            .expect("unable to open a session");
+        // The login state belongs to the token. Another session may have logged in already.
+        let _ = session.login(UserType::User, Some(&AuthPin::new(PIN.into())));
+
+        // DER of the OID for prime256v1 (P-256).
+        let ec_params = vec![0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+        let public = [Attribute::EcParams(ec_params), Attribute::Verify(true)];
+        let private = [
+            Attribute::Label(label.as_bytes().to_vec()),
+            Attribute::Token(true),
+            Attribute::Sensitive(true),
+            Attribute::Sign(true),
+        ];
+        session
+            .generate_key_pair(&Mechanism::EccKeyPairGen, &public, &private)
+            .expect("unable to generate the key pair");
+    }
+
+    #[test]
+    fn key_exists_finds_a_key_by_its_label() {
+        let _lock = with_test_token();
+        generate_key_pair("example-key");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        assert!(backend.key_exists("example-key").unwrap());
+    }
+
+    #[test]
+    fn key_exists_is_false_for_an_unknown_label() {
+        let _lock = with_test_token();
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        assert!(!backend.key_exists("no-such-key").unwrap());
+    }
+
+    #[test]
+    fn key_exists_needs_an_exact_label_match() {
+        let _lock = with_test_token();
+        generate_key_pair("example-exact");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        assert!(!backend.key_exists("example-exac").unwrap());
+        assert!(!backend.key_exists("EXAMPLE-EXACT").unwrap());
+        assert!(!backend.key_exists("example-exact ").unwrap());
     }
 }
