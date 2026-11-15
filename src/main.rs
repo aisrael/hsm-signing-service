@@ -13,6 +13,9 @@ use clap::crate_version;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::net::TcpListener;
+use tracing::instrument;
+use tracing::trace;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 const CRATE_VERSION: &str = crate_version!();
 
@@ -75,9 +78,11 @@ fn encode_hex(bytes: &[u8]) -> String {
     s
 }
 
+#[instrument(skip(request))]
 async fn handle_post_sign(
     Json(request): Json<SignRequest>,
 ) -> Result<Json<SignResponse>, ApiError> {
+    trace!("POST /v1/sign");
     // Validate that the payload is valid base64.
     let decoded_payload = BASE64.decode(&request.payload)?;
     // For now, we just return the payload in hex as the signature.
@@ -104,6 +109,7 @@ async fn main() {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_span_events(FmtSpan::CLOSE)
         .init();
 
     let app = Router::new().route("/v1/sign", post(handle_post_sign));
