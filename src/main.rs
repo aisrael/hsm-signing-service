@@ -192,9 +192,35 @@ async fn main() {
         Command::Server => run_server().await,
         Command::Encrypt { key_id } => run_encrypt(&key_id),
         Command::Decrypt { key_id } => run_decrypt(&key_id),
-        // Not implemented yet. The command only parses its arguments.
-        Command::Wrap { .. } => {}
+        Command::Wrap {
+            key_id,
+            target_key_id,
+        } => run_wrap(&key_id, &target_key_id),
     }
+}
+
+/// Wrap the EC private key `target_key_id` with the AES key `key_id` and print
+/// the wrapped key to STDOUT as base64. Errors go to STDERR and the process
+/// exits with code 1.
+fn run_wrap(key_id: &str, target_key_id: &str) {
+    let config = Config::try_from_env().unwrap_or_else(|err| {
+        eprintln!("Error loading configuration: {err}");
+        std::process::exit(1);
+    });
+
+    let hsm_backend = hsm_backend::CryptokiBackend::try_new(&config).unwrap_or_else(|err| {
+        eprintln!("Error initializing HSM backend: {err}");
+        std::process::exit(1);
+    });
+
+    let wrapped = hsm_backend
+        .wrap(key_id, target_key_id)
+        .unwrap_or_else(|err| {
+            eprintln!("Error wrapping the key: {err}");
+            std::process::exit(1);
+        });
+
+    println!("{}", BASE64.encode(wrapped));
 }
 
 /// Read STDIN, base64-decode it, decrypt it with the AES key `key_id` and write
