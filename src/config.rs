@@ -1,53 +1,99 @@
 //! The configuration for the HSM signing service.
 
+use std::{env::VarError, fs::File};
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// The environment variable is not set
+    #[error("Environment variable {0} is not set")]
+    EnvVarNotSet(&'static str),
+    /// The environment variable is set, but its value is not valid unicode
+    #[error("Environment variable {0} is not valid unicode")]
+    EnvVarNotUnicode(&'static str),
+    /// The environment variable is set, but its value is empty
+    #[error("Environment variable {0} is empty")]
+    EnvVarEmpty(&'static str),
     /// The HSM_SIGNING_SERVICE_PORT is not a valid u16
     #[error("HSM_SIGNING_SERVICE_PORT is not a valid u16: {0}")]
     InvalidHsmSigningServicePort(String),
-    /// The PKCS11_MODULE variable points to a non-existent file
-    #[error("PKCS11_MODULE points to a non-existent file: {0}")]
+    /// The PKCS11_MODULE variable points to a file that does not exist or is not readable
+    #[error("PKCS11_MODULE file not found or not readable: {0}")]
     Pkcs11ModuleNotFound(String),
-    /// The TOKEN_LABEL variable is not set
-    #[error("KEY_LABEL is not set")]
-    KeyLabelNotSet,
-    /// The HSM_PIN variable is not set
-    #[error("HSM_PIN is not set")]
-    HsmPinNotSet,
 }
 
 pub struct Config {
-    /// The host and port to bind the service to.
+    /// The host (address) to bind the service to.
     host: String,
     /// The port to bind the service to.
     port: u16,
     /// The path to the HSM PKCS#11 library
     pkcs11_module: String,
-    /// The token label
+    /// The label of the token. `setup.sh` uses the same label for the key.
     key_label: String,
     /// The PIN for the token
     hsm_pin: String,
 }
 
-/// The default host and port for the HSM signing service
+/// The default host for the HSM signing service
 const DEFAULT_HSM_SIGNING_SERVICE_HOST: &str = "127.0.0.1";
 /// The default port for the HSM signing service
 const DEFAULT_HSM_SIGNING_SERVICE_PORT: &str = "8080";
 /// The default path to the HSM PKCS#11 library
 const DEFAULT_PKCS11_MODULE: &str = "/opt/homebrew/opt/softhsm/lib/softhsm/libsofthsm2.so";
 
+/// Check if a file exists and is readable
+fn file_is_readable(path: &str) -> bool {
+    File::open(path).is_ok()
+}
+
+/// Read a required environment variable.
+///
+/// Fails if the variable is not set, is not valid unicode, or is empty.
+fn try_read_from_env(name: &'static str) -> Result<String, ConfigError> {
+    match std::env::var(name) {
+        Ok(value) if value.is_empty() => Err(ConfigError::EnvVarEmpty(name)),
+        Ok(value) => Ok(value),
+        Err(VarError::NotPresent) => Err(ConfigError::EnvVarNotSet(name)),
+        Err(VarError::NotUnicode(_)) => Err(ConfigError::EnvVarNotUnicode(name)),
+    }
+}
+
+/// Read an optional environment variable.
+///
+/// Returns `default` if the variable is not set. A variable that is set must
+/// still be valid unicode and not empty, so a mistake is never hidden by the
+/// default.
+fn try_read_from_env_with_default(
+    name: &'static str,
+    default: &str,
+) -> Result<String, ConfigError> {
+    match try_read_from_env(name) {
+        Err(ConfigError::EnvVarNotSet(_)) => Ok(default.to_owned()),
+        result => result,
+    }
+}
+
 impl Config {
     pub fn try_from_env() -> Result<Self, ConfigError> {
-        let host = std::env::var("HSM_SIGNING_SERVICE_HOST")
-            .unwrap_or_else(|_| DEFAULT_HSM_SIGNING_SERVICE_HOST.into());
-        let raw_port = std::env::var("HSM_SIGNING_SERVICE_PORT")
-            .unwrap_or_else(|_| DEFAULT_HSM_SIGNING_SERVICE_PORT.into());
+        let host = try_read_from_env_with_default(
+            "HSM_SIGNING_SERVICE_HOST",
+            DEFAULT_HSM_SIGNING_SERVICE_HOST,
+        )?;
+        let raw_port = try_read_from_env_with_default(
+            "HSM_SIGNING_SERVICE_PORT",
+            DEFAULT_HSM_SIGNING_SERVICE_PORT,
+        )?;
         let port = raw_port
             .parse::<u16>()
             .map_err(|_| ConfigError::InvalidHsmSigningServicePort(raw_port))?;
-        let pkcs11_module = std::env::var("PKCS11_MODULE").unwrap_or(DEFAULT_PKCS11_MODULE.into());
-        let key_label = std::env::var("KEY_LABEL").map_err(|_| ConfigError::KeyLabelNotSet)?;
-        let hsm_pin = std::env::var("HSM_PIN").map_err(|_| ConfigError::HsmPinNotSet)?;
+        let pkcs11_module = try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)?;
+
+        if !file_is_readable(&pkcs11_module) {
+            return Err(ConfigError::Pkcs11ModuleNotFound(pkcs11_module));
+        }
+
+        let key_label = try_read_from_env("KEY_LABEL")?;
+        let hsm_pin = try_read_from_env("HSM_PIN")?;
 
         Ok(Config {
             host,
@@ -72,5 +118,101 @@ impl Config {
 
     pub fn hsm_pin(&self) -> &str {
         &self.hsm_pin
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests change the process environment, which is shared by all
+    // tests that run in parallel. Each test uses its own variable name, and
+    // no other code reads these names.
+    //
+    // SAFETY (for every `set_var` call below): no other thread reads or
+    // writes these variables while the test runs.
+    fn set(name: &str, value: &str) {
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    #[test]
+    fn read_returns_the_value() {
+        set("CONFIG_TEST_READ_VALUE", "value");
+        assert_eq!(
+            try_read_from_env("CONFIG_TEST_READ_VALUE").unwrap(),
+            "value"
+        );
+    }
+
+    #[test]
+    fn read_fails_when_not_set() {
+        let result = try_read_from_env("CONFIG_TEST_READ_NOT_SET");
+        assert!(matches!(
+            result,
+            Err(ConfigError::EnvVarNotSet("CONFIG_TEST_READ_NOT_SET"))
+        ));
+    }
+
+    #[test]
+    fn read_fails_when_empty() {
+        set("CONFIG_TEST_READ_EMPTY", "");
+        let result = try_read_from_env("CONFIG_TEST_READ_EMPTY");
+        assert!(matches!(
+            result,
+            Err(ConfigError::EnvVarEmpty("CONFIG_TEST_READ_EMPTY"))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_fails_when_not_unicode() {
+        use std::os::unix::ffi::OsStrExt;
+        let value = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]);
+        unsafe { std::env::set_var("CONFIG_TEST_READ_NOT_UNICODE", value) };
+        let result = try_read_from_env("CONFIG_TEST_READ_NOT_UNICODE");
+        assert!(matches!(
+            result,
+            Err(ConfigError::EnvVarNotUnicode(
+                "CONFIG_TEST_READ_NOT_UNICODE"
+            ))
+        ));
+    }
+
+    #[test]
+    fn with_default_returns_the_value_when_set() {
+        set("CONFIG_TEST_DEFAULT_VALUE", "value");
+        let result = try_read_from_env_with_default("CONFIG_TEST_DEFAULT_VALUE", "default");
+        assert_eq!(result.unwrap(), "value");
+    }
+
+    #[test]
+    fn with_default_returns_the_default_when_not_set() {
+        let result = try_read_from_env_with_default("CONFIG_TEST_DEFAULT_NOT_SET", "default");
+        assert_eq!(result.unwrap(), "default");
+    }
+
+    #[test]
+    fn with_default_fails_when_empty() {
+        set("CONFIG_TEST_DEFAULT_EMPTY", "");
+        let result = try_read_from_env_with_default("CONFIG_TEST_DEFAULT_EMPTY", "default");
+        assert!(matches!(
+            result,
+            Err(ConfigError::EnvVarEmpty("CONFIG_TEST_DEFAULT_EMPTY"))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_default_fails_when_not_unicode() {
+        use std::os::unix::ffi::OsStrExt;
+        let value = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]);
+        unsafe { std::env::set_var("CONFIG_TEST_DEFAULT_NOT_UNICODE", value) };
+        let result = try_read_from_env_with_default("CONFIG_TEST_DEFAULT_NOT_UNICODE", "default");
+        assert!(matches!(
+            result,
+            Err(ConfigError::EnvVarNotUnicode(
+                "CONFIG_TEST_DEFAULT_NOT_UNICODE"
+            ))
+        ));
     }
 }
