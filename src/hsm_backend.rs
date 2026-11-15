@@ -56,6 +56,8 @@ pub enum HsmBackendError {
     InvalidCiphertext,
     #[error("the HSM failed to decrypt (wrong key or changed data): {0}")]
     Decrypt(#[source] CryptokiError),
+    #[error("the HSM failed to wrap the key (is it extractable?): {0}")]
+    Wrap(#[source] CryptokiError),
 }
 
 /// The length of the AES-GCM IV in bytes. 12 bytes (96 bits) is the usual size.
@@ -89,6 +91,14 @@ pub trait HsmBackend: Send + Sync + 'static {
     /// It fails if the key is wrong or if the data changed, because AES-GCM
     /// checks the tag. This method blocks.
     fn decrypt(&self, key_id: &str, encrypted: &[u8]) -> Result<Vec<u8>, HsmBackendError>;
+
+    /// Wrap the EC private key `target_key_id` with the AES key `key_id`,
+    /// using AES key wrap with padding inside the HSM.
+    ///
+    /// The result is the target key (PKCS#8) encrypted with the AES key. The
+    /// plain key never leaves the HSM. It fails if the target key is not
+    /// extractable. This method blocks.
+    fn wrap(&self, key_id: &str, target_key_id: &str) -> Result<Vec<u8>, HsmBackendError>;
 }
 
 /// Find the slot of the token that has the given label.
@@ -202,14 +212,25 @@ fn find_aes_keys(session: &Session, key_id: &str) -> Result<Vec<ObjectHandle>, C
     session.find_objects(&template)
 }
 
-/// Find the one AES key that has the label `key_id`.
-fn find_aes_key(session: &Session, key_id: &str) -> Result<ObjectHandle, HsmBackendError> {
-    let handles = find_aes_keys(session, key_id).map_err(HsmBackendError::FindKey)?;
+/// Return the handle if the search found exactly one key.
+fn exactly_one(handles: Vec<ObjectHandle>, key_id: &str) -> Result<ObjectHandle, HsmBackendError> {
     match handles.as_slice() {
         [key] => Ok(*key),
         [] => Err(HsmBackendError::KeyNotFound(key_id.to_string())),
         _ => Err(HsmBackendError::AmbiguousKey(key_id.to_string())),
     }
+}
+
+/// Find the one AES key that has the label `key_id`.
+fn find_aes_key(session: &Session, key_id: &str) -> Result<ObjectHandle, HsmBackendError> {
+    let handles = find_aes_keys(session, key_id).map_err(HsmBackendError::FindKey)?;
+    exactly_one(handles, key_id)
+}
+
+/// Find the one EC private key that has the label `key_id`.
+fn find_private_key(session: &Session, key_id: &str) -> Result<ObjectHandle, HsmBackendError> {
+    let handles = find_private_keys(session, key_id).map_err(HsmBackendError::FindKey)?;
+    exactly_one(handles, key_id)
 }
 
 impl HsmBackend for CryptokiBackend {
@@ -276,6 +297,18 @@ impl HsmBackend for CryptokiBackend {
         session
             .decrypt(&Mechanism::AesGcm(params), key, ciphertext)
             .map_err(HsmBackendError::Decrypt)
+    }
+
+    /// Wrap with `CKM_AES_KEY_WRAP_PAD`. The HSM exports the target key
+    /// encrypted. The plain key never leaves the token.
+    fn wrap(&self, key_id: &str, target_key_id: &str) -> Result<Vec<u8>, HsmBackendError> {
+        let session = self.session();
+        let wrapping_key = find_aes_key(&session, key_id)?;
+        let target_key = find_private_key(&session, target_key_id)?;
+
+        session
+            .wrap_key(&Mechanism::AesKeyWrapPad, wrapping_key, target_key)
+            .map_err(HsmBackendError::Wrap)
     }
 }
 
@@ -389,8 +422,19 @@ mod tests {
         );
     }
 
-    /// Generate an EC P-256 key pair inside the test token. Run once per label.
+    /// Generate an EC P-256 key pair inside the test token. The private key is
+    /// not extractable. Run once per label.
     fn generate_key_pair(label: &str) {
+        generate_ec_key_pair(label, false);
+    }
+
+    /// Generate an EC P-256 key pair whose private key is extractable (and
+    /// sensitive), so that it can be wrapped. Run once per label.
+    fn generate_exportable_key_pair(label: &str) {
+        generate_ec_key_pair(label, true);
+    }
+
+    fn generate_ec_key_pair(label: &str, extractable: bool) {
         let config = Config::for_test(TOKEN_LABEL, PIN);
         let pkcs11 = load_pkcs11(&config).expect("unable to load the module");
         let slot = find_token_by_label(pkcs11, TOKEN_LABEL).expect("token not found");
@@ -412,6 +456,7 @@ mod tests {
             Attribute::Label(label.as_bytes().to_vec()),
             Attribute::Token(true),
             Attribute::Sensitive(true),
+            Attribute::Extractable(extractable),
             Attribute::Sign(true),
         ];
         session
@@ -647,6 +692,99 @@ mod tests {
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
 
         let result = backend.encrypt("example-not-aes", b"hello world");
+
+        assert!(
+            matches!(result, Err(HsmBackendError::KeyNotFound(_))),
+            "unexpected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_returns_the_target_key_in_a_form_the_hsm_can_unwrap() {
+        let _lock = with_test_token();
+        generate_aes_key("example-wrap-kek");
+        generate_exportable_key_pair("example-wrap-target");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let payload = b"hello world";
+
+        let wrapped = backend
+            .wrap("example-wrap-kek", "example-wrap-target")
+            .expect("expected a wrapped key");
+
+        // Unwrap the blob into a temporary key. If it holds the original key,
+        // a signature from it verifies with the public key of the original.
+        let session = backend.session();
+        let kek = find_aes_key(&session, "example-wrap-kek").unwrap();
+        let template = [
+            Attribute::Class(ObjectClass::PRIVATE_KEY),
+            Attribute::KeyType(KeyType::EC),
+            Attribute::Label(b"example-wrap-unwrapped".to_vec()),
+            Attribute::Token(false),
+            Attribute::Sign(true),
+        ];
+        let unwrapped = session
+            .unwrap_key(&Mechanism::AesKeyWrapPad, kek, &wrapped, &template)
+            .expect("the HSM could not unwrap the key");
+        let raw = session
+            .sign(&Mechanism::EcdsaSha256, unwrapped, payload)
+            .expect("unable to sign with the unwrapped key");
+        let signature = Signature::from_slice(&raw).unwrap();
+        public_key("example-wrap-target")
+            .verify(payload, &signature)
+            .expect("the unwrapped key is not the original key");
+    }
+
+    #[test]
+    fn wrap_fails_for_a_key_that_is_not_extractable() {
+        let _lock = with_test_token();
+        generate_aes_key("example-wrap-kek-fixed");
+        generate_key_pair("example-wrap-fixed");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        let result = backend.wrap("example-wrap-kek-fixed", "example-wrap-fixed");
+
+        assert!(
+            matches!(result, Err(HsmBackendError::Wrap(_))),
+            "unexpected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_fails_for_an_unknown_wrapping_key() {
+        let _lock = with_test_token();
+        generate_exportable_key_pair("example-wrap-target-2");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        let result = backend.wrap("no-such-key", "example-wrap-target-2");
+
+        assert!(
+            matches!(result, Err(HsmBackendError::KeyNotFound(ref id)) if id == "no-such-key"),
+            "unexpected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_fails_for_an_unknown_target_key() {
+        let _lock = with_test_token();
+        generate_aes_key("example-wrap-kek-3");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        let result = backend.wrap("example-wrap-kek-3", "no-such-key");
+
+        assert!(
+            matches!(result, Err(HsmBackendError::KeyNotFound(ref id)) if id == "no-such-key"),
+            "unexpected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_does_not_accept_an_aes_key_as_the_target() {
+        let _lock = with_test_token();
+        generate_aes_key("example-wrap-kek-4");
+        generate_aes_key("example-wrap-aes-target");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        let result = backend.wrap("example-wrap-kek-4", "example-wrap-aes-target");
 
         assert!(
             matches!(result, Err(HsmBackendError::KeyNotFound(_))),
