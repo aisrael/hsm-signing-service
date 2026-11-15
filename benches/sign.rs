@@ -1,19 +1,23 @@
 //! A benchmark for `POST /v1/sign`.
 //!
-//! The benchmark starts the compiled service as a child process. One caller sends
-//! requests one after another. Each request has a payload of random words (3 to 10 words).
-//! The `--seed` option seeds the random number generator, so a run can use the same
-//! sequence of payloads again. First a warm-up phase runs, and its results are thrown
-//! away. Then the measured phase runs. The report shows the latency percentiles
-//! and the error rate.
+//! The benchmark starts the compiled service as a child process. Each caller
+//! runs in its own thread and sends requests one after another. Each request has
+//! a payload of random words (3 to 10 words). The `--concurrency` (`-C`) option
+//! sets the number of callers (1 to 1000). Repeat it to run several levels one
+//! after another. The `--seed` option seeds the random number generators, so a
+//! run can use the same sequence of payloads again. For each level, a warm-up
+//! phase runs first, and its results are thrown away. Then the measured phase
+//! runs. The report shows the latency percentiles and the error rate.
 //!
 //! ```sh
-//! cargo bench --bench sign -- --warmup-secs 5 --duration-secs 30 --seed 42
+//! cargo bench --bench sign -- --warmup-secs 5 --duration-secs 30 --seed 42 -C 1 -C 10 -C 100 -C 500
 //! ```
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 
+use std::sync::Barrier;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -61,6 +65,33 @@ struct Args {
     bench: bool,
 }
 
+/// The stack size of a caller thread. A caller thread does little work, so a
+/// small stack is enough. This matters at 1000 callers.
+const CALLER_STACK_SIZE: usize = 512 * 1024;
+
+/// One caller: it sends requests one after another, on its own connection,
+/// with its own random number generator.
+struct Caller {
+    agent: ureq::Agent,
+    rng: StdRng,
+}
+
+impl Caller {
+    /// Make `count` callers. With a seed, caller `i` uses the seed plus `i`, so
+    /// the callers send different payloads and a seeded run can repeat.
+    fn make_callers(count: u16, seed: Option<u64>) -> Vec<Caller> {
+        (0..u64::from(count))
+            .map(|index| Caller {
+                agent: ureq::Agent::new_with_defaults(),
+                rng: match seed {
+                    Some(seed) => StdRng::seed_from_u64(seed.wrapping_add(index)),
+                    None => make_rng(),
+                },
+            })
+            .collect()
+    }
+}
+
 /// The results of one phase.
 struct PhaseResults {
     /// The latencies of the successful requests.
@@ -69,6 +100,26 @@ struct PhaseResults {
     failed_requests: u64,
     /// How long the phase took.
     elapsed: Duration,
+}
+
+impl PhaseResults {
+    /// Combine the results of several callers: add the counts and join the
+    /// latencies. The phase took as long as the slowest caller.
+    fn merge(parts: Vec<PhaseResults>) -> PhaseResults {
+        let mut merged = PhaseResults {
+            latencies: Vec::new(),
+            total_requests: 0,
+            failed_requests: 0,
+            elapsed: Duration::ZERO,
+        };
+        for part in parts {
+            merged.latencies.extend(part.latencies);
+            merged.total_requests += part.total_requests;
+            merged.failed_requests += part.failed_requests;
+            merged.elapsed = merged.elapsed.max(part.elapsed);
+        }
+        merged
+    }
 }
 
 /// The report for one phase. The latencies are those of the successful
@@ -146,23 +197,18 @@ fn sign_once(agent: &ureq::Agent, url: &str, request: &Value) -> Option<Duration
     body["signature"].is_string().then(|| start.elapsed())
 }
 
-/// Send requests one after another until `duration` has passed. Make each
-/// payload before the request starts, so that it does not count in the latency.
-fn run_phase(
-    agent: &ureq::Agent,
-    url: &str,
-    key_id: &str,
-    rng: &mut StdRng,
-    duration: Duration,
-) -> PhaseResults {
+/// Run one caller: send requests one after another until `duration` has
+/// passed. Make each payload before the request starts, so that it does not
+/// count in the latency.
+fn run_caller(caller: &mut Caller, url: &str, key_id: &str, duration: Duration) -> PhaseResults {
     let start = Instant::now();
     let mut latencies = Vec::new();
     let mut total_requests = 0;
     let mut failed_requests = 0;
     while start.elapsed() < duration {
-        let request = random_request(key_id, rng);
+        let request = random_request(key_id, &mut caller.rng);
         total_requests += 1;
-        match sign_once(agent, url, &request) {
+        match sign_once(&caller.agent, url, &request) {
             Some(latency) => latencies.push(latency),
             None => failed_requests += 1,
         }
@@ -173,6 +219,32 @@ fn run_phase(
         failed_requests,
         elapsed: start.elapsed(),
     }
+}
+
+/// Run all callers at the same time, each in its own thread, for `duration`.
+/// The callers start together. Return their combined results.
+fn run_phase(url: &str, key_id: &str, callers: &mut [Caller], duration: Duration) -> PhaseResults {
+    let barrier = Barrier::new(callers.len());
+    let parts = thread::scope(|scope| {
+        let handles: Vec<_> = callers
+            .iter_mut()
+            .map(|caller| {
+                let barrier = &barrier;
+                thread::Builder::new()
+                    .stack_size(CALLER_STACK_SIZE)
+                    .spawn_scoped(scope, move || {
+                        barrier.wait();
+                        run_caller(caller, url, key_id, duration)
+                    })
+                    .expect("failed to start a caller thread")
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a caller thread panicked"))
+            .collect()
+    });
+    PhaseResults::merge(parts)
 }
 
 /// Print the report for the measured phase.
@@ -208,30 +280,28 @@ fn main() {
     let service = Service::start();
     let url = service.url("/v1/sign");
     let key_id = common::env_var("HSM_TOKEN_LABEL");
-    let agent = ureq::Agent::new_with_defaults();
-    let mut rng = match args.seed {
-        Some(seed) => StdRng::seed_from_u64(seed),
-        None => make_rng(),
-    };
 
-    println!("warm-up: {} s", args.warmup_secs);
-    run_phase(
-        &agent,
-        &url,
-        &key_id,
-        &mut rng,
-        Duration::from_secs(args.warmup_secs),
-    );
+    for &concurrency in &args.concurrency {
+        println!("\n== {concurrency} concurrent callers ==");
+        let mut callers = Caller::make_callers(concurrency, args.seed);
 
-    println!("measuring: {} s", args.duration_secs);
-    let report = Report::from(run_phase(
-        &agent,
-        &url,
-        &key_id,
-        &mut rng,
-        Duration::from_secs(args.duration_secs),
-    ));
-    print_report(&report);
+        println!("warm-up: {} s", args.warmup_secs);
+        run_phase(
+            &url,
+            &key_id,
+            &mut callers,
+            Duration::from_secs(args.warmup_secs),
+        );
+
+        println!("measuring: {} s", args.duration_secs);
+        let report = Report::from(run_phase(
+            &url,
+            &key_id,
+            &mut callers,
+            Duration::from_secs(args.duration_secs),
+        ));
+        print_report(&report);
+    }
 
     // The service stops when `service` is dropped.
 }
