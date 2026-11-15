@@ -1,7 +1,7 @@
 //! The configuration for the HSM signing service.
 
-use std::{env::VarError, fs::File};
 use std::time::Duration;
+use std::{env::VarError, fs::File};
 
 use secrecy::SecretString;
 

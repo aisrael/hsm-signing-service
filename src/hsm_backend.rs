@@ -302,8 +302,8 @@ impl HsmBackend for CryptokiBackend {
         payload: &[u8],
         signature: &[u8],
     ) -> Result<bool, HsmBackendError> {
-        let signature = Signature::from_der(signature)
-            .map_err(HsmBackendError::InvalidSignatureEncoding)?;
+        let signature =
+            Signature::from_der(signature).map_err(HsmBackendError::InvalidSignatureEncoding)?;
         let raw = signature.to_bytes();
 
         let session = self.session();
@@ -311,9 +311,10 @@ impl HsmBackend for CryptokiBackend {
 
         match session.verify(&Mechanism::EcdsaSha256, key, payload, &raw) {
             Ok(()) => Ok(true),
-            Err(CryptokiError::Pkcs11(RvError::SignatureInvalid | RvError::SignatureLenRange, _)) => {
-                Ok(false)
-            }
+            Err(CryptokiError::Pkcs11(
+                RvError::SignatureInvalid | RvError::SignatureLenRange,
+                _,
+            )) => Ok(false),
             Err(e) => Err(HsmBackendError::Verify(e)),
         }
     }
