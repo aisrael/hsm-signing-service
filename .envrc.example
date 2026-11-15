@@ -24,3 +24,8 @@ export EXPORTABLE_KEY_LABEL="example-exportable"
 # The service address and port to bind to
 export HSM_SIGNING_SERVICE_HOST="127.0.0.1"
 export HSM_SIGNING_SERVICE_PORT="8080"
+
+# How many seconds the server waits for running requests after SIGINT or
+# SIGTERM. The server exits with code 1 if requests are still running after
+# this time. Use a whole number of 1 or more.
+export HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS="30"

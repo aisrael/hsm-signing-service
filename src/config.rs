@@ -1,6 +1,7 @@
 //! The configuration for the HSM signing service.
 
 use std::{env::VarError, fs::File};
+use std::time::Duration;
 
 use secrecy::SecretString;
 
@@ -18,6 +19,11 @@ pub enum ConfigError {
     /// The HSM_SIGNING_SERVICE_PORT is not a valid u16
     #[error("HSM_SIGNING_SERVICE_PORT is not a valid u16: {0}")]
     InvalidHsmSigningServicePort(String),
+    /// The HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS is not a whole number of 1 or more
+    #[error(
+        "HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS must be a whole number of seconds, 1 or more: {0}"
+    )]
+    InvalidShutdownTimeout(String),
     /// The PKCS11_MODULE variable points to a file that does not exist or is not readable
     #[error("PKCS11_MODULE file not found or not readable: {0}")]
     Pkcs11ModuleNotFound(String),
@@ -29,6 +35,8 @@ pub struct Config {
     host: String,
     /// The port to bind the service to.
     port: u16,
+    /// How long the server waits for running requests after a shutdown signal.
+    shutdown_timeout: Duration,
     /// The path to the HSM PKCS#11 library
     pkcs11_module: String,
     /// The label of the token. `setup.sh` uses the same label for the key.
@@ -41,8 +49,19 @@ pub struct Config {
 const DEFAULT_HSM_SIGNING_SERVICE_HOST: &str = "127.0.0.1";
 /// The default port for the HSM signing service
 const DEFAULT_HSM_SIGNING_SERVICE_PORT: &str = "8080";
+/// The default number of seconds to wait for running requests on shutdown
+const DEFAULT_SHUTDOWN_TIMEOUT_SECS: &str = "30";
 /// The default path to the HSM PKCS#11 library
 const DEFAULT_PKCS11_MODULE: &str = "/opt/homebrew/opt/softhsm/lib/softhsm/libsofthsm2.so";
+
+/// Parse the shutdown timeout: a whole number of seconds, 1 or more. Zero is
+/// not valid, because it would end all running requests at once.
+fn parse_shutdown_timeout(raw: String) -> Result<Duration, ConfigError> {
+    match raw.parse::<u64>() {
+        Ok(secs) if secs >= 1 => Ok(Duration::from_secs(secs)),
+        _ => Err(ConfigError::InvalidShutdownTimeout(raw)),
+    }
+}
 
 /// Check if a file exists and is readable
 fn file_is_readable(path: &str) -> bool {
@@ -89,6 +108,10 @@ impl Config {
         let port = raw_port
             .parse::<u16>()
             .map_err(|_| ConfigError::InvalidHsmSigningServicePort(raw_port))?;
+        let shutdown_timeout = parse_shutdown_timeout(try_read_from_env_with_default(
+            "HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS",
+            DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+        )?)?;
         let pkcs11_module = try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)?;
 
         if !file_is_readable(&pkcs11_module) {
@@ -101,6 +124,7 @@ impl Config {
         Ok(Config {
             host,
             port,
+            shutdown_timeout,
             pkcs11_module,
             token_label,
             hsm_pin,
@@ -116,6 +140,8 @@ impl Config {
             port: DEFAULT_HSM_SIGNING_SERVICE_PORT
                 .parse()
                 .expect("the default port is valid"),
+            shutdown_timeout: parse_shutdown_timeout(DEFAULT_SHUTDOWN_TIMEOUT_SECS.into())
+                .expect("the default shutdown timeout is valid"),
             pkcs11_module: try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)
                 .expect("PKCS11_MODULE is valid"),
             token_label: token_label.into(),
@@ -125,6 +151,11 @@ impl Config {
 
     pub fn addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// How long to wait for running requests after a shutdown signal.
+    pub fn shutdown_timeout(&self) -> Duration {
+        self.shutdown_timeout
     }
 
     pub fn pkcs11_module(&self) -> &str {
@@ -234,6 +265,35 @@ mod tests {
                 "CONFIG_TEST_DEFAULT_NOT_UNICODE"
             ))
         ));
+    }
+
+    #[test]
+    fn shutdown_timeout_accepts_a_whole_number_of_seconds() {
+        assert_eq!(
+            parse_shutdown_timeout("30".into()).unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_shutdown_timeout("1".into()).unwrap(),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_rejects_other_values() {
+        for raw in ["0", "abc", "-5", "1.5", "18446744073709551616", " 5"] {
+            let result = parse_shutdown_timeout(raw.into());
+            assert!(
+                matches!(&result, Err(ConfigError::InvalidShutdownTimeout(value)) if value == raw),
+                "{raw:?}: unexpected {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_shutdown_timeout_is_valid() {
+        let config = Config::for_test("example", "0000");
+        assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
     }
 
     #[test]

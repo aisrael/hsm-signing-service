@@ -9,6 +9,11 @@ use clap::Parser;
 use clap::Subcommand;
 use clap::crate_version;
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::signal::unix::SignalKind;
+#[cfg(unix)]
+use tokio::signal::unix::signal;
+use tokio::sync::oneshot;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 use crate::api;
@@ -198,5 +203,64 @@ async fn run_server() {
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
     tracing::info!("listening on {addr}");
 
-    axum::serve(listener, app).await.expect("server error");
+    // The server stops on a shutdown signal and waits for running requests.
+    // The channel tells the drain timer when the signal arrived.
+    let (signal_tx, signal_rx) = oneshot::channel::<()>();
+    let server = async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                tracing::info!("shutdown signal received, waiting for running requests");
+                let _ = signal_tx.send(());
+            })
+            .await
+    };
+    let drain_timeout = config.shutdown_timeout();
+    let drain_timer = async move {
+        // Without a signal the channel closes, and the timer must never fire.
+        if signal_rx.await.is_ok() {
+            tokio::time::sleep(drain_timeout).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    tokio::select! {
+        result = server => {
+            result.expect("server error");
+            tracing::info!("shut down");
+        }
+        () = drain_timer => {
+            tracing::warn!(
+                "requests still running after {} seconds, exiting",
+                drain_timeout.as_secs()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Wait for Ctrl+C or, on Unix, for SIGTERM (the signal that Docker and
+/// Kubernetes send to stop a container).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install the Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal(SignalKind::terminate())
+            .expect("failed to install the SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }
