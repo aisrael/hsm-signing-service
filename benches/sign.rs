@@ -45,6 +45,17 @@ struct Args {
     /// a seed, every run uses different payloads.
     #[arg(long)]
     seed: Option<u64>,
+    /// The number of concurrent callers (1 to 1000). Repeat the option or
+    /// separate the values with commas to run several levels, for example
+    /// `-C 1 -C 10` or `--concurrency 1,10`.
+    #[arg(
+        short = 'C',
+        long,
+        value_delimiter = ',',
+        default_value = "1",
+        value_parser = clap::value_parser!(u16).range(1..=1000),
+    )]
+    concurrency: Vec<u16>,
     /// Cargo passes this flag to every benchmark. The benchmark ignores it.
     #[arg(long, hide = true)]
     bench: bool,
