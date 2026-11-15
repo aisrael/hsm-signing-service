@@ -173,6 +173,16 @@ enum Command {
         #[arg(long)]
         key_id: String,
     },
+    /// Wrap an EC private key with an AES key inside the HSM. Print the
+    /// wrapped key to STDOUT as base64.
+    Wrap {
+        /// The label of the AES key that wraps the other key.
+        #[arg(long)]
+        key_id: String,
+        /// The label of the EC private key to wrap. It must be extractable.
+        #[arg(long)]
+        target_key_id: String,
+    },
 }
 
 #[tokio::main]
@@ -182,6 +192,8 @@ async fn main() {
         Command::Server => run_server().await,
         Command::Encrypt { key_id } => run_encrypt(&key_id),
         Command::Decrypt { key_id } => run_decrypt(&key_id),
+        // Not implemented yet. The command only parses its arguments.
+        Command::Wrap { .. } => {}
     }
 }
 
