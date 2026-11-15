@@ -48,6 +48,7 @@ jobs:
       - name: Run tests
         env:
           PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
+          AES_KEY_LABEL: example-aes
         # These tests sign with CKM_ECDSA_SHA256. The SoftHSM in Ubuntu (2.6.1)
         # does not support it (added in 2.7.0). Remove the skips when CI has 2.7.0.
         run: |
