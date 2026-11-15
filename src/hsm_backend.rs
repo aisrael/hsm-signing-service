@@ -8,6 +8,7 @@ use cryptoki::context::CInitializeArgs;
 use cryptoki::context::CInitializeFlags;
 use cryptoki::context::Pkcs11;
 use cryptoki::error::Error as CryptokiError;
+use cryptoki::error::RvError;
 use cryptoki::mechanism::Mechanism;
 use cryptoki::mechanism::aead::GcmParams;
 use cryptoki::object::Attribute;
@@ -48,6 +49,10 @@ pub enum HsmBackendError {
     Sign(#[source] CryptokiError),
     #[error("the HSM returned an invalid signature: {0}")]
     InvalidSignature(#[source] p256::ecdsa::Error),
+    #[error("the HSM failed to verify the signature: {0}")]
+    Verify(#[source] CryptokiError),
+    #[error("the signature is not a valid DER-encoded ECDSA signature: {0}")]
+    InvalidSignatureEncoding(#[source] p256::ecdsa::Error),
     #[error("the HSM failed to generate a random IV: {0}")]
     GenerateIv(#[source] CryptokiError),
     #[error("the HSM failed to encrypt: {0}")]
@@ -71,6 +76,19 @@ const GCM_MIN_LEN: usize = GCM_IV_LEN as usize + (GCM_TAG_BITS / 8) as usize;
 pub trait HsmBackend: Send + Sync + 'static {
     /// Sign the given payload using the specified key.
     fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, HsmBackendError>;
+
+    /// Verify a DER-encoded ECDSA signature of `payload` with the EC public
+    /// key that has the label `key_id`, using `CKM_ECDSA_SHA256` inside the HSM.
+    ///
+    /// Return `Ok(false)` if the signature does not match. Return an error if
+    /// the key does not exist, if `signature` is not valid DER, or if the HSM
+    /// fails. This method blocks.
+    fn verify(
+        &self,
+        key_id: &str,
+        payload: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, HsmBackendError>;
 
     /// Check whether the token holds an EC private key with the label `key_id`.
     ///
@@ -201,6 +219,17 @@ fn find_private_keys(session: &Session, key_id: &str) -> Result<Vec<ObjectHandle
     session.find_objects(&template)
 }
 
+/// Find the EC public keys that have the label `key_id`. The label is
+/// matched as exact bytes.
+fn find_public_keys(session: &Session, key_id: &str) -> Result<Vec<ObjectHandle>, CryptokiError> {
+    let template = [
+        Attribute::Class(ObjectClass::PUBLIC_KEY),
+        Attribute::KeyType(KeyType::EC),
+        Attribute::Label(key_id.as_bytes().to_vec()),
+    ];
+    session.find_objects(&template)
+}
+
 /// Find the AES secret keys that have the label `key_id`. The label is
 /// matched as exact bytes.
 fn find_aes_keys(session: &Session, key_id: &str) -> Result<Vec<ObjectHandle>, CryptokiError> {
@@ -233,6 +262,12 @@ fn find_private_key(session: &Session, key_id: &str) -> Result<ObjectHandle, Hsm
     exactly_one(handles, key_id)
 }
 
+/// Find the one EC public key that has the label `key_id`.
+fn find_public_key(session: &Session, key_id: &str) -> Result<ObjectHandle, HsmBackendError> {
+    let handles = find_public_keys(session, key_id).map_err(HsmBackendError::FindKey)?;
+    exactly_one(handles, key_id)
+}
+
 impl HsmBackend for CryptokiBackend {
     fn key_exists(&self, key_id: &str) -> Result<bool, HsmBackendError> {
         let session = self.session();
@@ -257,6 +292,30 @@ impl HsmBackend for CryptokiBackend {
             .map_err(HsmBackendError::Sign)?;
         let signature = Signature::from_slice(&raw).map_err(HsmBackendError::InvalidSignature)?;
         Ok(signature.to_der().as_bytes().to_vec())
+    }
+
+    /// Verify with `CKM_ECDSA_SHA256`. The HSM hashes the payload. It expects
+    /// the raw `r || s` form, so the DER signature is converted first.
+    fn verify(
+        &self,
+        key_id: &str,
+        payload: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, HsmBackendError> {
+        let signature = Signature::from_der(signature)
+            .map_err(HsmBackendError::InvalidSignatureEncoding)?;
+        let raw = signature.to_bytes();
+
+        let session = self.session();
+        let key = find_public_key(&session, key_id)?;
+
+        match session.verify(&Mechanism::EcdsaSha256, key, payload, &raw) {
+            Ok(()) => Ok(true),
+            Err(CryptokiError::Pkcs11(RvError::SignatureInvalid | RvError::SignatureLenRange, _)) => {
+                Ok(false)
+            }
+            Err(e) => Err(HsmBackendError::Verify(e)),
+        }
     }
 
     /// Encrypt with `CKM_AES_GCM`. The IV comes from the HSM random number
@@ -535,6 +594,112 @@ mod tests {
         public_key("example-sign")
             .verify(payload, &signature)
             .expect("the signature does not verify");
+    }
+
+    #[test]
+    fn verify_accepts_a_signature_from_sign() {
+        let _lock = with_test_token();
+        generate_key_pair("example-verify");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let der = backend.sign("example-verify", b"hello world").unwrap();
+
+        let result = backend.verify("example-verify", b"hello world", &der);
+
+        assert!(matches!(result, Ok(true)), "unexpected: {result:?}");
+    }
+
+    #[test]
+    fn verify_rejects_another_payload() {
+        let _lock = with_test_token();
+        generate_key_pair("example-verify-payload");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let der = backend
+            .sign("example-verify-payload", b"hello world")
+            .unwrap();
+
+        let result = backend.verify("example-verify-payload", b"hello World", &der);
+
+        assert!(matches!(result, Ok(false)), "unexpected: {result:?}");
+    }
+
+    #[test]
+    fn verify_rejects_a_changed_signature() {
+        let _lock = with_test_token();
+        generate_key_pair("example-verify-changed");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let der = backend
+            .sign("example-verify-changed", b"hello world")
+            .unwrap();
+        // Change one bit inside `r`, then encode the signature as DER again.
+        let mut raw = Signature::from_der(&der).unwrap().to_bytes();
+        raw[5] ^= 0x01;
+        let changed = Signature::from_slice(&raw).unwrap().to_der();
+
+        let result = backend.verify("example-verify-changed", b"hello world", changed.as_bytes());
+
+        assert!(matches!(result, Ok(false)), "unexpected: {result:?}");
+    }
+
+    #[test]
+    fn verify_rejects_a_signature_from_another_key() {
+        let _lock = with_test_token();
+        generate_key_pair("example-verify-key-a");
+        generate_key_pair("example-verify-key-b");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let der = backend
+            .sign("example-verify-key-a", b"hello world")
+            .unwrap();
+
+        let result = backend.verify("example-verify-key-b", b"hello world", &der);
+
+        assert!(matches!(result, Ok(false)), "unexpected: {result:?}");
+    }
+
+    #[test]
+    fn verify_fails_when_the_signature_is_not_der() {
+        let _lock = with_test_token();
+        generate_key_pair("example-verify-garbage");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        let result = backend.verify("example-verify-garbage", b"hello world", b"not a signature");
+
+        assert!(
+            matches!(result, Err(HsmBackendError::InvalidSignatureEncoding(_))),
+            "unexpected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_fails_for_an_unknown_label() {
+        let _lock = with_test_token();
+        generate_key_pair("example-verify-known");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let der = backend
+            .sign("example-verify-known", b"hello world")
+            .unwrap();
+
+        let result = backend.verify("no-such-key", b"hello world", &der);
+
+        assert!(
+            matches!(result, Err(HsmBackendError::KeyNotFound(_))),
+            "unexpected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_fails_for_an_aes_key_label() {
+        let _lock = with_test_token();
+        generate_key_pair("example-verify-sig");
+        generate_aes_key("example-verify-aes");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let der = backend.sign("example-verify-sig", b"hello world").unwrap();
+
+        let result = backend.verify("example-verify-aes", b"hello world", &der);
+
+        assert!(
+            matches!(result, Err(HsmBackendError::KeyNotFound(_))),
+            "unexpected: {result:?}"
+        );
     }
 
     /// Generate a non-extractable AES-256 key inside the test token.

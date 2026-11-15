@@ -27,7 +27,7 @@ sh ./setup.sh
 
 ## Usage
 
-The program has four commands: `server`, `encrypt`, `decrypt` and `wrap`. If you give no command, the program runs `server`.
+The program has five commands: `server`, `encrypt`, `decrypt`, `verify` and `wrap`. If you give no command, the program runs `server`.
 
 ```sh
 cargo run -- --help
@@ -120,6 +120,38 @@ The command ignores spaces and newlines around the input. It writes the plaintex
 AES-GCM checks the tag. The command fails if you use the wrong key or if someone changed the data. It also fails if the input is not valid base64 or is shorter than 28 bytes (the IV and the tag).
 
 If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.
+
+### `verify`
+
+Checks an ECDSA signature inside the HSM (`CKM_ECDSA_SHA256`). The command reads the payload from STDIN and uses the EC public key of the key pair.
+
+The following arguments are required:
+
+- `--key-id`: the label of the EC key pair that made the signature. The public key must have the same label as the private key.
+- `--signature`: the signature as base64 of the DER form. This is the `signature` field of the API response.
+
+```sh
+printf 'hello world' | cargo run -- verify --key-id example --signature MEUCIQ...
+```
+
+This example signs through the API and then verifies the result (it needs `jq`):
+
+```sh
+printf 'hello world' > payload.txt
+signature=$(curl -s -X POST http://127.0.0.1:8080/v1/sign \
+  -H 'Content-Type: application/json' \
+  -d "{\"key_id\": \"example\", \"algorithm\": \"ECDSA_P256_SHA256\", \"payload\": \"$(base64 < payload.txt)\"}" \
+  | jq -r .signature)
+cargo run -- verify --key-id example --signature "$signature" < payload.txt
+```
+
+The API takes the payload as base64, but `verify` takes the raw bytes on STDIN. The command uses the input exactly as it is, so a newline at the end changes the result. Use `printf` or `echo -n`.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | The signature matches. The command prints `valid` to STDOUT. |
+| 1 | The signature does not match, or an error happened (for example, the key does not exist or the signature is not valid base64 or DER). The command prints a message to STDERR. STDOUT stays empty. |
+| 2 | An argument is missing or wrong. |
 
 ### `wrap`
 

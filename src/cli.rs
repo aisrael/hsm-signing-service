@@ -52,6 +52,17 @@ enum Command {
         #[arg(long)]
         key_id: String,
     },
+    /// Verify a signature of the payload (read from STDIN as raw bytes) with
+    /// the EC public key inside the HSM. Print `valid` and exit with code 0 if
+    /// the signature matches. Otherwise exit with code 1.
+    Verify {
+        /// The label of the EC key pair that made the signature.
+        #[arg(long)]
+        key_id: String,
+        /// The signature as base64 of the DER form, as the API returns it.
+        #[arg(long)]
+        signature: String,
+    },
     /// Wrap an EC private key with an AES key inside the HSM. Print the
     /// wrapped key to STDOUT as base64.
     Wrap {
@@ -71,11 +82,51 @@ pub async fn run() {
         Command::Server => run_server().await,
         Command::Encrypt { key_id } => do_encrypt(&key_id),
         Command::Decrypt { key_id } => do_decrypt(&key_id),
+        Command::Verify { key_id, signature } => do_verify(&key_id, &signature),
         Command::Wrap {
             key_id,
             target_key_id,
         } => do_wrap(&key_id, &target_key_id),
     }
+}
+
+/// Read STDIN as the payload and verify the base64 DER `signature` with the EC
+/// public key `key_id`. Print `valid` to STDOUT if it matches. Otherwise print
+/// an error to STDERR and exit with code 1.
+fn do_verify(key_id: &str, signature: &str) {
+    let config = Config::try_from_env().unwrap_or_else(|err| {
+        eprintln!("Error loading configuration: {err}");
+        std::process::exit(1);
+    });
+
+    let signature = BASE64.decode(signature.trim()).unwrap_or_else(|err| {
+        eprintln!("Error: the signature is not valid base64: {err}");
+        std::process::exit(1);
+    });
+
+    let mut payload = Vec::new();
+    if let Err(err) = std::io::stdin().read_to_end(&mut payload) {
+        eprintln!("Error reading STDIN: {err}");
+        std::process::exit(1);
+    }
+
+    let hsm_backend = hsm_backend::CryptokiBackend::try_new(&config).unwrap_or_else(|err| {
+        eprintln!("Error initializing HSM backend: {err}");
+        std::process::exit(1);
+    });
+
+    let valid = hsm_backend
+        .verify(key_id, &payload, &signature)
+        .unwrap_or_else(|err| {
+            eprintln!("Error verifying the signature: {err}");
+            std::process::exit(1);
+        });
+
+    if !valid {
+        eprintln!("Error: the signature is not valid");
+        std::process::exit(1);
+    }
+    println!("valid");
 }
 
 /// Wrap the EC private key `target_key_id` with the AES key `key_id` and print

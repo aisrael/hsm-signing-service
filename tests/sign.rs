@@ -54,6 +54,13 @@ fn post_sign_returns_a_der_signature() {
         )
         .expect("the signature is not valid base64");
     Signature::from_der(&der).expect("the signature is not valid DER");
+    // The HSM accepts the signature for the same payload and the public key.
+    let signature = body["signature"].as_str().unwrap();
+    let output = common::run(
+        &["verify", "--key-id", "example", "--signature", signature],
+        b"hello world",
+    );
+    common::assert_succeeded(&output);
     assert!(
         body["duration_ms"].is_u64(),
         "duration_ms is not a non-negative integer: {}",
