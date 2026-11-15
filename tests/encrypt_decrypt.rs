@@ -8,44 +8,18 @@
 //! Run `setup.sh` once before you run the tests, so that the token and the AES
 //! key exist.
 
-use std::io::Write;
-use std::process::Command;
-use std::process::Output;
-use std::process::Stdio;
+mod common;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-
-/// Read a required environment variable.
-fn env_var(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| {
-        panic!(
-            "{name} is not set. Set it in your environment (or copy `.envrc.example` \
-             to `.envrc` and use `direnv allow`), then run `sh ./setup.sh`"
-        )
-    })
-}
+use common::assert_failed;
+use common::assert_succeeded;
+use common::env_var;
+use common::run;
 
 /// The label of the AES key. `setup.sh` creates the key with this label.
 fn key_id() -> String {
     env_var("AES_KEY_LABEL")
-}
-
-/// Run the program with the given arguments. `stdin` is the input. The program
-/// inherits the environment of the test, which holds the token and PIN.
-fn run(args: &[&str], stdin: &[u8]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hsm-signing-service"))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to start the program");
-    // The program reads all of STDIN before it writes, so this cannot block.
-    // It may exit before it reads (for example, on a usage error). Then the
-    // write fails, and the test checks the exit status instead.
-    let _ = child.stdin.take().expect("no STDIN").write_all(stdin);
-    child.wait_with_output().expect("failed to wait")
 }
 
 /// Encrypt with the AES key. The test fails if the command fails.
@@ -60,28 +34,6 @@ fn decrypt(encrypted: &str) -> Vec<u8> {
     let output = run(&["decrypt", "--key-id", &key_id()], encrypted.as_bytes());
     assert_succeeded(&output);
     output.stdout
-}
-
-fn assert_succeeded(output: &Output) {
-    assert!(
-        output.status.success(),
-        "the command failed ({}): {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// Check that the command failed with exit code 1, wrote nothing to STDOUT
-/// and gave an error message that does not show the PIN.
-fn assert_failed(output: &Output) {
-    assert_eq!(output.status.code(), Some(1), "unexpected: {output:?}");
-    assert!(output.stdout.is_empty(), "STDOUT is not empty");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.is_empty(), "no error message");
-    assert!(
-        !stderr.contains(&env_var("HSM_PIN")),
-        "the error message shows the PIN"
-    );
 }
 
 #[test]

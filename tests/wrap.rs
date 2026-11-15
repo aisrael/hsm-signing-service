@@ -8,21 +8,16 @@
 //! Run `setup.sh` once before you run the tests, so that the token and the
 //! keys exist.
 
-use std::process::Command;
+mod common;
+
 use std::process::Output;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-
-/// Read a required environment variable.
-fn env_var(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| {
-        panic!(
-            "{name} is not set. Set it in your environment (or copy `.envrc.example` \
-             to `.envrc` and use `direnv allow`), then run `sh ./setup.sh`"
-        )
-    })
-}
+use common::assert_failed;
+use common::assert_succeeded;
+use common::env_var;
+use common::run;
 
 /// The AES key that wraps the other key.
 fn aes_key() -> String {
@@ -34,45 +29,21 @@ fn exportable_key() -> String {
     env_var("EXPORTABLE_KEY_LABEL")
 }
 
-/// Run `wrap` with the given arguments. The program inherits the environment
-/// of the test, which holds the token and PIN.
+/// Run `wrap` with the given arguments.
 fn run_wrap(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hsm-signing-service"))
-        .arg("wrap")
-        .args(args)
-        .output()
-        .expect("failed to run the program")
+    run(&[&["wrap"][..], args].concat(), b"")
 }
 
 /// Wrap the exportable key with the AES key. The test fails if the command fails.
 fn wrap_exportable_key() -> String {
     let output = run_wrap(&["--key-id", &aes_key(), "--target-key-id", &exportable_key()]);
-    assert!(
-        output.status.success(),
-        "the command failed ({}): {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_succeeded(&output);
     assert!(
         output.stderr.is_empty(),
         "unexpected STDERR: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("the output is not UTF-8")
-}
-
-/// Check that the command failed with exit code 1, wrote nothing to STDOUT
-/// and gave an error message that does not show the PIN. Return the message.
-fn assert_failed(output: &Output) -> String {
-    assert_eq!(output.status.code(), Some(1), "unexpected: {output:?}");
-    assert!(output.stdout.is_empty(), "STDOUT is not empty");
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(!stderr.is_empty(), "no error message");
-    assert!(
-        !stderr.contains(&env_var("HSM_PIN")),
-        "the error message shows the PIN"
-    );
-    stderr
 }
 
 #[test]
