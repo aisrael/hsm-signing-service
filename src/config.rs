@@ -104,6 +104,22 @@ impl Config {
         })
     }
 
+    /// A `Config` for tests that need a token. The PKCS#11 module comes from
+    /// `PKCS11_MODULE` or the default, like in `try_from_env`.
+    #[cfg(test)]
+    pub fn for_test(key_label: &str, hsm_pin: &str) -> Self {
+        Config {
+            host: DEFAULT_HSM_SIGNING_SERVICE_HOST.into(),
+            port: DEFAULT_HSM_SIGNING_SERVICE_PORT
+                .parse()
+                .expect("the default port is valid"),
+            pkcs11_module: try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)
+                .expect("PKCS11_MODULE is valid"),
+            key_label: key_label.into(),
+            hsm_pin: hsm_pin.into(),
+        }
+    }
+
     pub fn addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }

@@ -3,12 +3,17 @@
 //! The tests start the compiled service as a child process and talk to it
 //! over HTTP only. They use no types or functions from the service code.
 
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::process::Child;
+use std::process::Command;
+use std::process::Stdio;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 
 const ADDR: &str = "127.0.0.1";
 

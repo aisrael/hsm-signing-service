@@ -113,7 +113,7 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let hsm_backend = hsm_backend::SoftHsm2Backend::try_new(&config).unwrap_or_else(|err| {
+    let hsm_backend = hsm_backend::CryptokiBackend::try_new(&config).unwrap_or_else(|err| {
         eprintln!("Error initializing HSM backend: {err}");
         std::process::exit(1);
     });

@@ -1,7 +1,10 @@
 //! Application errors
 
+use crate::hsm_backend::HsmBackendError;
+
+/// Application errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Unable to initialize HSM backend: {0}")]
-    HsmBackendInitializationError(String),
+    #[error("HSM backend error: {0}")]
+    BackendError(#[from] HsmBackendError),
 }
