@@ -17,6 +17,13 @@ use tracing::instrument;
 use tracing::trace;
 use tracing_subscriber::fmt::format::FmtSpan;
 
+mod app_state;
+mod config;
+mod errors;
+
+use app_state::AppState;
+use config::Config;
+
 const CRATE_VERSION: &str = crate_version!();
 
 /// The algorithm to use for signing.
@@ -98,12 +105,16 @@ async fn handle_post_sign(
 
 #[tokio::main]
 async fn main() {
-    let hsm_signing_service_host =
-        std::env::var("HSM_SIGNING_SERVICE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let hsm_signing_service_port =
-        std::env::var("HSM_SIGNING_SERVICE_PORT").unwrap_or_else(|_| "8080".into());
-
     println!("hsm-signing-service version {CRATE_VERSION} starting...");
+
+    let config = Config::try_from_env().unwrap_or_else(|err| {
+        eprintln!("Error loading configuration: {err}");
+        std::process::exit(1);
+    });
+    let app_state = AppState::try_new(&config).unwrap_or_else(|err| {
+        eprintln!("Error initializing application state: {err}");
+        std::process::exit(1);
+    });
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -114,7 +125,7 @@ async fn main() {
 
     let app = Router::new().route("/v1/sign", post(handle_post_sign));
 
-    let addr = format!("{hsm_signing_service_host}:{hsm_signing_service_port}");
+    let addr = config.addr();
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
     tracing::info!("listening on {addr}");
 
