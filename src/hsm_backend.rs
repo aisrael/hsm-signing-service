@@ -129,7 +129,7 @@ impl CryptokiBackend {
     pub fn try_new(config: &Config) -> Result<Self, HsmBackendError> {
         let pkcs11 = load_pkcs11(config)?;
 
-        let token_label = config.key_label();
+        let token_label = config.token_label();
         let slot = find_token_by_label(pkcs11, token_label)?;
 
         let session = open_logged_in_session(pkcs11, slot, config)?;

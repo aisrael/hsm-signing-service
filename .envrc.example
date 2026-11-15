@@ -8,7 +8,7 @@ export HSM_PIN="change-me-too"
 # The label to use for the token and keys. You can change this label, but use
 # only alphanumeric characters (a-z, A-Z, 0-9). Other characters, such as ".",
 # can break the label checks in setup.sh.
-export KEY_LABEL="example"
+export HSM_TOKEN_LABEL="example"
 
 # The service address and port to bind to
 export HSM_SIGNING_SERVICE_HOST="127.0.0.1"

@@ -4,8 +4,8 @@
 ################################################################################
 # Check for required environment variables and exit with an error if they are not set.
 
-if [ -z "$KEY_LABEL" ]; then
-    echo "Error: KEY_LABEL is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
+if [ -z "$HSM_TOKEN_LABEL" ]; then
+    echo "Error: HSM_TOKEN_LABEL is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
     exit 1
 fi
 
@@ -50,18 +50,18 @@ fi
 
 set -eu
 
-if "$SOFTHSM" --show-slots | grep -q -E '^[[:space:]]+Label:[[:space:]]+'"$KEY_LABEL"'[[:space:]]*$'; then
+if "$SOFTHSM" --show-slots | grep -q -E '^[[:space:]]+Label:[[:space:]]+'"$HSM_TOKEN_LABEL"'[[:space:]]*$'; then
     echo "SoftHSM2 token already initialized. Skipping."
 else
     echo "Initializing SoftHSM2 token..."
-    "$SOFTHSM" --init-token --free --label "$KEY_LABEL" --so-pin "$HSM_SO_PIN" --pin "$HSM_PIN"
+    "$SOFTHSM" --init-token --free --label "$HSM_TOKEN_LABEL" --so-pin "$HSM_SO_PIN" --pin "$HSM_PIN"
 fi
 
-CHECK_KEY=$("$PKCS_TOOL" --module "$PKCS11_MODULE" --token-label "$KEY_LABEL" --login --pin "$HSM_PIN" --list-objects)
-if echo "$CHECK_KEY" | grep -q -E 'label:[[:space:]]+'"$KEY_LABEL"'[[:space:]]*$'; then
+CHECK_KEY=$("$PKCS_TOOL" --module "$PKCS11_MODULE" --token-label "$HSM_TOKEN_LABEL" --login --pin "$HSM_PIN" --list-objects)
+if echo "$CHECK_KEY" | grep -q -E 'label:[[:space:]]+'"$HSM_TOKEN_LABEL"'[[:space:]]*$'; then
     echo "Keys already generated. Skipping."
 else
     echo "Generating keys..."
-    "$PKCS_TOOL" --module "$PKCS11_MODULE" --token-label "$KEY_LABEL" --login --pin "$HSM_PIN" \
-        --keypairgen --key-type EC:prime256v1 --id 01 --label "$KEY_LABEL" --usage-sign
+    "$PKCS_TOOL" --module "$PKCS11_MODULE" --token-label "$HSM_TOKEN_LABEL" --login --pin "$HSM_PIN" \
+        --keypairgen --key-type EC:prime256v1 --id 01 --label "$HSM_TOKEN_LABEL" --usage-sign
 fi

@@ -32,7 +32,7 @@ pub struct Config {
     /// The path to the HSM PKCS#11 library
     pkcs11_module: String,
     /// The label of the token. `setup.sh` uses the same label for the key.
-    key_label: String,
+    token_label: String,
     /// The PIN for the token
     hsm_pin: SecretString,
 }
@@ -95,14 +95,14 @@ impl Config {
             return Err(ConfigError::Pkcs11ModuleNotFound(pkcs11_module));
         }
 
-        let key_label = try_read_from_env("KEY_LABEL")?;
+        let token_label = try_read_from_env("HSM_TOKEN_LABEL")?;
         let hsm_pin = SecretString::from(try_read_from_env("HSM_PIN")?);
 
         Ok(Config {
             host,
             port,
             pkcs11_module,
-            key_label,
+            token_label,
             hsm_pin,
         })
     }
@@ -110,7 +110,7 @@ impl Config {
     /// A `Config` for tests that need a token. The PKCS#11 module comes from
     /// `PKCS11_MODULE` or the default, like in `try_from_env`.
     #[cfg(test)]
-    pub fn for_test(key_label: &str, hsm_pin: &str) -> Self {
+    pub fn for_test(token_label: &str, hsm_pin: &str) -> Self {
         Config {
             host: DEFAULT_HSM_SIGNING_SERVICE_HOST.into(),
             port: DEFAULT_HSM_SIGNING_SERVICE_PORT
@@ -118,7 +118,7 @@ impl Config {
                 .expect("the default port is valid"),
             pkcs11_module: try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)
                 .expect("PKCS11_MODULE is valid"),
-            key_label: key_label.into(),
+            token_label: token_label.into(),
             hsm_pin: SecretString::from(hsm_pin),
         }
     }
@@ -131,8 +131,8 @@ impl Config {
         &self.pkcs11_module
     }
 
-    pub fn key_label(&self) -> &str {
-        &self.key_label
+    pub fn token_label(&self) -> &str {
+        &self.token_label
     }
 
     /// The PIN. Call `expose_secret()` only where the PIN is really needed.
