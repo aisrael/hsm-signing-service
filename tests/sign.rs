@@ -12,6 +12,9 @@ use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use p256::ecdsa::Signature;
 use serde_json::Value;
 use serde_json::json;
 
@@ -73,7 +76,7 @@ impl Drop for Service {
 }
 
 #[test]
-fn post_sign_echoes_the_payload() {
+fn post_sign_returns_a_der_signature() {
     let service = Service::start();
 
     let request = json!({
@@ -105,8 +108,15 @@ fn post_sign_echoes_the_payload() {
 
     assert_eq!(body["key_id"], "example");
     assert_eq!(body["algorithm"], "ECDSA_P256_SHA256");
-    // For now, the service echoes the payload as the signature.
-    assert_eq!(body["signature"], "aGVsbG8gd29ybGQ=");
+    // The signature is base64 of a DER-encoded ECDSA signature.
+    let der = BASE64
+        .decode(
+            body["signature"]
+                .as_str()
+                .expect("signature is not a string"),
+        )
+        .expect("the signature is not valid base64");
+    Signature::from_der(&der).expect("the signature is not valid DER");
     assert!(
         body["duration_ms"].is_u64(),
         "duration_ms is not a non-negative integer: {}",

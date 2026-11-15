@@ -28,6 +28,7 @@ use app_state::AppState;
 use config::Config;
 
 use crate::hsm_backend::HsmBackend;
+use crate::hsm_backend::HsmBackendError;
 
 const CRATE_VERSION: &str = crate_version!();
 
@@ -68,6 +69,9 @@ pub enum ApiError {
     /// The `payload` field is not valid base64.
     #[error("Unable to base64 decode payload: {0}")]
     PayloadBase64DecodingError(#[from] base64::DecodeError),
+    /// No private key has the label `key_id`. The label is not echoed back.
+    #[error("Key not found")]
+    KeyNotFound,
     /// Something failed inside the service. The cause is logged, not sent.
     #[error("Internal error")]
     Internal(String),
@@ -77,6 +81,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match &self {
             ApiError::PayloadBase64DecodingError(_) => StatusCode::BAD_REQUEST,
+            ApiError::KeyNotFound => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::Internal(cause) => {
                 tracing::error!("internal error: {cause}");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -108,11 +113,25 @@ where
     let backend_state = Arc::clone(&state);
     let key_id = request.key_id.clone();
     let signature = tokio::task::spawn_blocking(move || {
-        backend_state.hsm_backend.sign(&key_id, &decoded_payload)
+        let backend = &backend_state.hsm_backend;
+        // The key can still disappear before `sign` runs. Then `sign` returns
+        // `KeyNotFound` and the client gets the same error.
+        if !backend
+            .key_exists(&key_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+        {
+            return Err(ApiError::KeyNotFound);
+        }
+        backend
+            .sign(&key_id, &decoded_payload)
+            .map_err(|e| match e {
+                // The key was removed after `key_exists` found it.
+                HsmBackendError::KeyNotFound(_) => ApiError::KeyNotFound,
+                e => ApiError::Internal(e.to_string()),
+            })
     })
     .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?
-    .map_err(ApiError::Internal)?;
+    .map_err(|e| ApiError::Internal(e.to_string()))??;
 
     let response = SignResponse {
         key_id: request.key_id,
@@ -183,6 +202,11 @@ mod tests {
 
         let mut backend = MockHsmBackend::new();
         backend
+            .expect_key_exists()
+            .withf(|key_id| key_id == "example")
+            .times(1)
+            .returning(|_| Ok(true));
+        backend
             .expect_sign()
             .withf(|key_id, payload| key_id == "example" && payload == b"hello world")
             .times(1)
@@ -208,6 +232,7 @@ mod tests {
 
         // The payload is rejected before the backend is called.
         let mut backend = MockHsmBackend::new();
+        backend.expect_key_exists().never();
         backend.expect_sign().never();
 
         let result = handle_post_sign(state_with(backend), Json(request)).await;
@@ -218,5 +243,92 @@ mod tests {
             matches!(err, ApiError::PayloadBase64DecodingError(_)),
             "Expected PayloadBase64DecodingError, got {err:?}"
         );
+    }
+
+    fn request(key_id: &str) -> Json<SignRequest> {
+        Json(SignRequest {
+            key_id: key_id.to_string(),
+            algorithm: Algorithm::EcdsaP256Sha256,
+            payload: "aGVsbG8gd29ybGQ=".to_string(), // "hello world"
+        })
+    }
+
+    #[tokio::test]
+    async fn handle_post_sign_unknown_key() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_key_exists()
+            .times(1)
+            .returning(|_| Ok(false));
+        backend.expect_sign().never();
+
+        let err = handle_post_sign(state_with(backend), request("no-such-key"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::KeyNotFound), "got {err:?}");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_post_sign_key_lookup_fails() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_key_exists()
+            .times(1)
+            .returning(|_| Err(HsmBackendError::TokenNotFound("secret-detail".into())));
+        backend.expect_sign().never();
+
+        let err = handle_post_sign(state_with(backend), request("example"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::Internal(_)), "got {err:?}");
+        // The client message must not carry the cause.
+        assert_eq!(err.to_string(), "Internal error");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_post_sign_key_removed_before_signing() {
+        let mut backend = MockHsmBackend::new();
+        backend.expect_key_exists().times(1).returning(|_| Ok(true));
+        backend
+            .expect_sign()
+            .times(1)
+            .returning(|key_id, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
+
+        let err = handle_post_sign(state_with(backend), request("example"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::KeyNotFound), "got {err:?}");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_post_sign_sign_fails() {
+        let mut backend = MockHsmBackend::new();
+        backend.expect_key_exists().times(1).returning(|_| Ok(true));
+        backend
+            .expect_sign()
+            .times(1)
+            .returning(|_, _| Err(HsmBackendError::AmbiguousKey("secret-detail".into())));
+
+        let err = handle_post_sign(state_with(backend), request("example"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::Internal(_)), "got {err:?}");
+        assert_eq!(err.to_string(), "Internal error");
     }
 }
