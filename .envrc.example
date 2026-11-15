@@ -10,6 +10,11 @@ export HSM_PIN="change-me-too"
 # can break the label checks in setup.sh.
 export HSM_TOKEN_LABEL="example"
 
+# The label of the AES-256 key in the token. `setup.sh` creates the key with
+# this label, and the integration tests use it. Use the same characters as for
+# the token label, plus "-".
+export AES_KEY_LABEL="example-aes"
+
 # The service address and port to bind to
 export HSM_SIGNING_SERVICE_HOST="127.0.0.1"
 export HSM_SIGNING_SERVICE_PORT="8080"

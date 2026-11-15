@@ -10,6 +10,11 @@ if [ -z "$HSM_TOKEN_LABEL" ]; then
     exit 1
 fi
 
+if [ -z "$AES_KEY_LABEL" ]; then
+    echo "Error: AES_KEY_LABEL is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
+    exit 1
+fi
+
 if [ -z "$HSM_SO_PIN" ]; then
     echo "Error: HSM_SO_PIN is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
     exit 1
@@ -85,8 +90,6 @@ fi
 
 ################################################################################
 # Create the AES-256 key if it doesn't already exist.
-
-AES_KEY_LABEL="${HSM_TOKEN_LABEL}-aes"
 
 if has_object "$AES_KEY_LABEL" secrkey; then
     echo "AES key already generated. Skipping."
