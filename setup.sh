@@ -1,5 +1,6 @@
 #!/bin/sh
-# Initialize the example token and keys in softhsm2
+# Initialize the example token and keys in softhsm2 for local development and testing.
+# This script is idempotent, so it can be run multiple times without causing errors.
 
 ################################################################################
 # Check for required environment variables and exit with an error if they are not set.
@@ -45,6 +46,24 @@ if [ -z "$PKCS_TOOL" ]; then
     exit 1
 fi
 
+# Run pkcs11-tool with arguments
+pkcs11() {
+    "$PKCS_TOOL" --module "$PKCS11_MODULE" --token-label "$HSM_TOKEN_LABEL" --login --pin "$HSM_PIN" "$@"
+}
+
+# Succeeds if the token has an object with the label in the first argument. The
+# optional second argument is an object type for `pkcs11-tool --type` (for
+# example `privkey` or `secrkey`). Without it, objects of all types are searched.
+has_object() {
+    label="$1"
+    if [ -n "${2:-}" ]; then
+        set -- --type "$2"
+    else
+        set --
+    fi
+    pkcs11 --list-objects "$@" | grep -q -E 'label:[[:space:]]+'"$label"'[[:space:]]*$'
+}
+
 ################################################################################
 # Create the token and keys if they don't already exist.
 
@@ -57,11 +76,27 @@ else
     "$SOFTHSM" --init-token --free --label "$HSM_TOKEN_LABEL" --so-pin "$HSM_SO_PIN" --pin "$HSM_PIN"
 fi
 
-CHECK_KEY=$("$PKCS_TOOL" --module "$PKCS11_MODULE" --token-label "$HSM_TOKEN_LABEL" --login --pin "$HSM_PIN" --list-objects)
-if echo "$CHECK_KEY" | grep -q -E 'label:[[:space:]]+'"$HSM_TOKEN_LABEL"'[[:space:]]*$'; then
+if has_object "$HSM_TOKEN_LABEL"; then
     echo "Keys already generated. Skipping."
 else
     echo "Generating keys..."
-    "$PKCS_TOOL" --module "$PKCS11_MODULE" --token-label "$HSM_TOKEN_LABEL" --login --pin "$HSM_PIN" \
-        --keypairgen --key-type EC:prime256v1 --id 01 --label "$HSM_TOKEN_LABEL" --usage-sign
+    pkcs11 --keypairgen --key-type EC:prime256v1 --id 01 --label "$HSM_TOKEN_LABEL" --usage-sign
+fi
+
+################################################################################
+# Create the AES-256 key if it doesn't already exist.
+
+AES_KEY_LABEL="${HSM_TOKEN_LABEL}-aes"
+
+if has_object "$AES_KEY_LABEL" secrkey; then
+    echo "AES key already generated. Skipping."
+else
+    echo "Generating the AES-256 key..."
+    pkcs11 --keygen --key-type aes:32 --id 02 --label "$AES_KEY_LABEL" --sensitive --usage-decrypt
+fi
+
+# No secret key in the token may be extractable.
+if pkcs11 --list-objects --type secrkey | grep 'Access:' | grep -v -q 'never extractable'; then
+    echo "Error: a secret key in the token is extractable." >&2
+    exit 1
 fi
