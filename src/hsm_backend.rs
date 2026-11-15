@@ -18,6 +18,7 @@ use cryptoki::session::UserType;
 use cryptoki::slot::Slot;
 use cryptoki::types::AuthPin;
 use p256::ecdsa::Signature;
+use secrecy::ExposeSecret;
 
 use crate::config::Config;
 
@@ -106,7 +107,10 @@ fn open_logged_in_session(
         .open_ro_session(slot)
         .map_err(HsmBackendError::OpenSession)?;
     session
-        .login(UserType::User, Some(&AuthPin::new(config.hsm_pin().into())))
+        .login(
+            UserType::User,
+            Some(&AuthPin::new(config.hsm_pin().expose_secret().into())),
+        )
         .map_err(HsmBackendError::Login)?;
     Ok(session)
 }

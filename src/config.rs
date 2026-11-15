@@ -2,6 +2,8 @@
 
 use std::{env::VarError, fs::File};
 
+use secrecy::SecretString;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// The environment variable is not set
@@ -31,7 +33,7 @@ pub struct Config {
     /// The label of the token. `setup.sh` uses the same label for the key.
     key_label: String,
     /// The PIN for the token
-    hsm_pin: String,
+    hsm_pin: SecretString,
 }
 
 /// The default host for the HSM signing service
@@ -93,7 +95,7 @@ impl Config {
         }
 
         let key_label = try_read_from_env("KEY_LABEL")?;
-        let hsm_pin = try_read_from_env("HSM_PIN")?;
+        let hsm_pin = SecretString::from(try_read_from_env("HSM_PIN")?);
 
         Ok(Config {
             host,
@@ -116,7 +118,7 @@ impl Config {
             pkcs11_module: try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)
                 .expect("PKCS11_MODULE is valid"),
             key_label: key_label.into(),
-            hsm_pin: hsm_pin.into(),
+            hsm_pin: SecretString::from(hsm_pin),
         }
     }
 
@@ -132,7 +134,8 @@ impl Config {
         &self.key_label
     }
 
-    pub fn hsm_pin(&self) -> &str {
+    /// The PIN. Call `expose_secret()` only where the PIN is really needed.
+    pub fn hsm_pin(&self) -> &SecretString {
         &self.hsm_pin
     }
 }
