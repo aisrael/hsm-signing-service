@@ -1,17 +1,11 @@
 //! A benchmark for `POST /v1/sign`.
 //!
-//! The benchmark starts the compiled service as a child process. It uses the
-//! environment variables of the developer (see `.envrc.example`) and needs the
-//! token and the signing key (see `setup.sh`). The signing key has the same
-//! label as the token, so the benchmark takes the `key_id` from
-//! `HSM_TOKEN_LABEL`.
-//!
-//! One caller sends requests one after another. Each request has a payload
-//! of random words (3 to 20 words, from the `fake` crate). The `--seed`
-//! option seeds the random number generator, so a run can use the same
-//! sequence of payloads again. First a warm-up phase runs,
-//! and its results are thrown away. Then the measured phase runs. The report
-//! shows the latency percentiles and the error rate.
+//! The benchmark starts the compiled service as a child process. One caller sends
+//! requests one after another. Each request has a payload of random words (3 to 10 words).
+//! The `--seed` option seeds the random number generator, so a run can use the same
+//! sequence of payloads again. First a warm-up phase runs, and its results are thrown
+//! away. Then the measured phase runs. The report shows the latency percentiles
+//! and the error rate.
 //!
 //! ```sh
 //! cargo bench --bench sign -- --warmup-secs 5 --duration-secs 30 --seed 42
@@ -35,7 +29,7 @@ use fake::rand::rngs::StdRng;
 use serde_json::Value;
 use serde_json::json;
 
-/// The number of words in a payload: from 3 up to (not including) 21, so a
+/// The number of words in a payload: from 3 up to (not including) 11, so a
 /// payload has 3 to 10 words.
 const WORDS: std::ops::Range<usize> = 3..11;
 

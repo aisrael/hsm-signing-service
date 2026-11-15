@@ -8,9 +8,11 @@
 // Each test file is a separate crate and uses only some of these helpers.
 #![allow(dead_code)]
 
+use std::fs::File;
 use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Output;
@@ -85,13 +87,25 @@ fn free_port() -> u16 {
 pub struct Service {
     pub child: Child,
     addr: String,
+    /// The file that holds the STDERR of the service. The
+    /// file is read only if the service fails to start.
+    stderr_path: PathBuf,
 }
 
 impl Service {
     /// Start the service on a free port and wait until it accepts connections.
+    ///
+    /// Panic at once, with the STDERR of the service, if the service exits
+    /// during startup (for example, because of a wrong setting). Panic with the
+    /// STDERR too if the service does not accept connections within 10 seconds.
     pub fn start() -> Self {
         let port = free_port();
         let addr = format!("{ADDR}:{port}");
+        let stderr_path = std::env::temp_dir().join(format!(
+            "hsm-signing-service-{}-{port}.stderr",
+            std::process::id()
+        ));
+        let stderr = File::create(&stderr_path).expect("failed to create the STDERR file");
 
         // Set both variables, so values from the developer's shell (for
         // example, from `.envrc`) cannot change the address.
@@ -99,21 +113,39 @@ impl Service {
             .env("HSM_SIGNING_SERVICE_HOST", ADDR)
             .env("HSM_SIGNING_SERVICE_PORT", port.to_string())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("failed to start the service");
-        let service = Service { child, addr };
+        let mut service = Service {
+            child,
+            addr,
+            stderr_path,
+        };
 
-        // Wait until the service accepts connections.
+        // Wait until the service accepts connections. Stop at once if the
+        // service exits.
         let deadline = Instant::now() + Duration::from_secs(10);
         while TcpStream::connect(&service.addr).is_err() {
+            if let Some(status) = service.child.try_wait().expect("failed to wait") {
+                panic!(
+                    "the service exited during startup ({status}):\n{}",
+                    service.stderr()
+                );
+            }
             assert!(
                 Instant::now() < deadline,
-                "the service did not start within 10 seconds"
+                "the service did not start within 10 seconds:\n{}",
+                service.stderr()
             );
             sleep(Duration::from_millis(50));
         }
         service
+    }
+
+    /// What the service wrote to STDERR so far.
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path)
+            .unwrap_or_else(|err| format!("(unable to read the STDERR file: {err})"))
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -125,5 +157,6 @@ impl Drop for Service {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.stderr_path);
     }
 }
