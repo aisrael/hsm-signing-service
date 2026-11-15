@@ -1,9 +1,12 @@
 //! A simple HTTP service that signs payloads using a hardware security module (HSM).
 
+use std::fmt::Debug;
 use std::fmt::Write;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
@@ -24,6 +27,8 @@ mod hsm_backend;
 
 use app_state::AppState;
 use config::Config;
+
+use crate::hsm_backend::HsmBackend;
 
 const CRATE_VERSION: &str = crate_version!();
 
@@ -87,9 +92,13 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 #[instrument(skip(request))]
-async fn handle_post_sign(
+async fn handle_post_sign<B>(
+    State(state): State<Arc<AppState<B>>>,
     Json(request): Json<SignRequest>,
-) -> Result<Json<SignResponse>, ApiError> {
+) -> Result<Json<SignResponse>, ApiError>
+where
+    B: HsmBackend + Debug,
+{
     trace!("POST /v1/sign");
     // Validate that the payload is valid base64.
     let decoded_payload = BASE64.decode(&request.payload)?;
@@ -123,6 +132,8 @@ async fn main() {
         std::process::exit(1);
     });
 
+    let state = Arc::new(app_state);
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -130,7 +141,9 @@ async fn main() {
         .with_span_events(FmtSpan::CLOSE)
         .init();
 
-    let app = Router::new().route("/v1/sign", post(handle_post_sign));
+    let app = Router::new()
+        .route("/v1/sign", post(handle_post_sign))
+        .with_state(state);
 
     let addr = config.addr();
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
@@ -143,6 +156,22 @@ async fn main() {
 mod tests {
     use super::*;
 
+    /// A backend that needs no HSM. It returns the payload as the signature.
+    #[derive(Debug)]
+    struct MockBackend;
+
+    impl HsmBackend for MockBackend {
+        fn sign(&self, _key_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+            Ok(payload.to_vec())
+        }
+    }
+
+    fn mock_state() -> State<Arc<AppState<MockBackend>>> {
+        let config = Config::for_test("example", "0000");
+        let app_state = AppState::try_new(&config, MockBackend).expect("unable to build the state");
+        State(Arc::new(app_state))
+    }
+
     #[tokio::test]
     async fn handle_post_sign_echoes_the_payload() {
         let request = SignRequest {
@@ -151,7 +180,7 @@ mod tests {
             payload: "aGVsbG8gd29ybGQ=".to_string(), // "hello world"
         };
 
-        let Json(response) = handle_post_sign(Json(request))
+        let Json(response) = handle_post_sign(mock_state(), Json(request))
             .await
             .expect("Expected Ok(Json(SignResponse))");
 
@@ -169,7 +198,7 @@ mod tests {
             payload: "invalid_base64".to_string(),
         };
 
-        let result = handle_post_sign(Json(request)).await;
+        let result = handle_post_sign(mock_state(), Json(request)).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();

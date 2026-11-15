@@ -89,6 +89,7 @@ fn open_logged_in_session(
 }
 
 /// A connection to a SoftHSM2 token through the PKCS#11 (Cryptoki) interface.
+#[derive(Debug)]
 pub struct CryptokiBackend {
     /// A logged-in session. `Session` is not `Sync`, so it sits behind a `Mutex`.
     #[allow(dead_code)]

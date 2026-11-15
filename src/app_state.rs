@@ -5,6 +5,7 @@ use crate::errors::Error;
 use crate::hsm_backend::HsmBackend;
 
 /// The shared application state.
+#[derive(Debug)]
 pub struct AppState<B: HsmBackend> {
     // Add any shared state here, e.g. database connections, HSM clients, etc.
     pub hsm_backend: B,
