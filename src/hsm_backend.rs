@@ -52,12 +52,18 @@ pub enum HsmBackendError {
     GenerateIv(#[source] CryptokiError),
     #[error("the HSM failed to encrypt: {0}")]
     Encrypt(#[source] CryptokiError),
+    #[error("the encrypted data is too short")]
+    InvalidCiphertext,
+    #[error("the HSM failed to decrypt (wrong key or changed data): {0}")]
+    Decrypt(#[source] CryptokiError),
 }
 
 /// The length of the AES-GCM IV in bytes. 12 bytes (96 bits) is the usual size.
 const GCM_IV_LEN: u32 = 12;
 /// The length of the AES-GCM authentication tag in bits.
 const GCM_TAG_BITS: u64 = 128;
+/// The shortest valid encrypted data: the IV and the tag, with an empty ciphertext.
+const GCM_MIN_LEN: usize = GCM_IV_LEN as usize + (GCM_TAG_BITS / 8) as usize;
 
 #[cfg_attr(test, mockall::automock)]
 pub trait HsmBackend: Send + Sync + 'static {
@@ -76,6 +82,13 @@ pub trait HsmBackend: Send + Sync + 'static {
     /// tag has 16 bytes. The HSM generates a new random IV for every call, so
     /// the caller cannot choose it. This method blocks.
     fn encrypt(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, HsmBackendError>;
+
+    /// Decrypt data from `encrypt` with the AES key that has the label
+    /// `key_id`. The input is `iv || ciphertext || tag`.
+    ///
+    /// It fails if the key is wrong or if the data changed, because AES-GCM
+    /// checks the tag. This method blocks.
+    fn decrypt(&self, key_id: &str, encrypted: &[u8]) -> Result<Vec<u8>, HsmBackendError>;
 }
 
 /// Find the slot of the token that has the given label.
@@ -189,6 +202,16 @@ fn find_aes_keys(session: &Session, key_id: &str) -> Result<Vec<ObjectHandle>, C
     session.find_objects(&template)
 }
 
+/// Find the one AES key that has the label `key_id`.
+fn find_aes_key(session: &Session, key_id: &str) -> Result<ObjectHandle, HsmBackendError> {
+    let handles = find_aes_keys(session, key_id).map_err(HsmBackendError::FindKey)?;
+    match handles.as_slice() {
+        [key] => Ok(*key),
+        [] => Err(HsmBackendError::KeyNotFound(key_id.to_string())),
+        _ => Err(HsmBackendError::AmbiguousKey(key_id.to_string())),
+    }
+}
+
 impl HsmBackend for CryptokiBackend {
     fn key_exists(&self, key_id: &str) -> Result<bool, HsmBackendError> {
         let session = self.session();
@@ -219,13 +242,7 @@ impl HsmBackend for CryptokiBackend {
     /// generator. The key never leaves the token.
     fn encrypt(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
         let session = self.session();
-
-        let handles = find_aes_keys(&session, key_id).map_err(HsmBackendError::FindKey)?;
-        let key = match handles.as_slice() {
-            [key] => *key,
-            [] => return Err(HsmBackendError::KeyNotFound(key_id.to_string())),
-            _ => return Err(HsmBackendError::AmbiguousKey(key_id.to_string())),
-        };
+        let key = find_aes_key(&session, key_id)?;
 
         let mut iv = session
             .generate_random_vec(GCM_IV_LEN)
@@ -241,6 +258,24 @@ impl HsmBackend for CryptokiBackend {
         let mut output = iv_copy;
         output.extend_from_slice(&encrypted);
         Ok(output)
+    }
+
+    /// Decrypt with `CKM_AES_GCM`. The HSM checks the tag.
+    fn decrypt(&self, key_id: &str, encrypted: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
+        if encrypted.len() < GCM_MIN_LEN {
+            return Err(HsmBackendError::InvalidCiphertext);
+        }
+        let (iv, ciphertext) = encrypted.split_at(GCM_IV_LEN as usize);
+
+        let session = self.session();
+        let key = find_aes_key(&session, key_id)?;
+
+        let mut iv = iv.to_vec();
+        let params =
+            GcmParams::new(&mut iv, &[], GCM_TAG_BITS.into()).map_err(HsmBackendError::Decrypt)?;
+        session
+            .decrypt(&Mechanism::AesGcm(params), key, ciphertext)
+            .map_err(HsmBackendError::Decrypt)
     }
 }
 
@@ -481,20 +516,6 @@ mod tests {
             .expect("unable to generate the AES key");
     }
 
-    /// Decrypt `iv || ciphertext || tag` with the AES key `label`, in the test token.
-    fn decrypt(
-        backend: &CryptokiBackend,
-        label: &str,
-        encrypted: &[u8],
-    ) -> Result<Vec<u8>, CryptokiError> {
-        let session = backend.session();
-        let key = find_aes_keys(&session, label).unwrap()[0];
-        let (iv, ciphertext) = encrypted.split_at(GCM_IV_LEN as usize);
-        let mut iv = iv.to_vec();
-        let params = GcmParams::new(&mut iv, &[], GCM_TAG_BITS.into()).unwrap();
-        session.decrypt(&Mechanism::AesGcm(params), key, ciphertext)
-    }
-
     #[test]
     fn encrypt_output_decrypts_to_the_plaintext() {
         let _lock = with_test_token();
@@ -508,8 +529,9 @@ mod tests {
 
         // 12 bytes of IV, the ciphertext (same length as the plaintext), 16 bytes of tag.
         assert_eq!(encrypted.len(), 12 + plaintext.len() + 16);
-        let decrypted =
-            decrypt(&backend, "example-aes-round-trip", &encrypted).expect("expected to decrypt");
+        let decrypted = backend
+            .decrypt("example-aes-round-trip", &encrypted)
+            .expect("expected to decrypt");
         assert_eq!(decrypted, plaintext);
     }
 
@@ -538,7 +560,58 @@ mod tests {
         // Change one bit of the ciphertext.
         encrypted[12] ^= 0x01;
 
-        assert!(decrypt(&backend, "example-aes-tamper", &encrypted).is_err());
+        let result = backend.decrypt("example-aes-tamper", &encrypted);
+
+        assert!(
+            matches!(result, Err(HsmBackendError::Decrypt(_))),
+            "unexpected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn decrypt_fails_with_another_key() {
+        let _lock = with_test_token();
+        generate_aes_key("example-aes-key-a");
+        generate_aes_key("example-aes-key-b");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let encrypted = backend
+            .encrypt("example-aes-key-a", b"hello world")
+            .unwrap();
+
+        let result = backend.decrypt("example-aes-key-b", &encrypted);
+
+        assert!(
+            matches!(result, Err(HsmBackendError::Decrypt(_))),
+            "unexpected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn decrypt_fails_when_the_data_is_too_short() {
+        let _lock = with_test_token();
+        generate_aes_key("example-aes-short");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        // One byte less than an IV and a tag.
+        let result = backend.decrypt("example-aes-short", &[0u8; 27]);
+
+        assert!(
+            matches!(result, Err(HsmBackendError::InvalidCiphertext)),
+            "unexpected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn decrypt_fails_for_a_key_that_does_not_exist() {
+        let _lock = with_test_token();
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        let result = backend.decrypt("no-such-key", &[0u8; 28]);
+
+        assert!(
+            matches!(result, Err(HsmBackendError::KeyNotFound(ref id)) if id == "no-such-key"),
+            "unexpected: {result:?}"
+        );
     }
 
     #[test]
@@ -550,7 +623,7 @@ mod tests {
         let encrypted = backend.encrypt("example-aes-empty", b"").unwrap();
 
         assert_eq!(encrypted.len(), 12 + 16);
-        let decrypted = decrypt(&backend, "example-aes-empty", &encrypted).unwrap();
+        let decrypted = backend.decrypt("example-aes-empty", &encrypted).unwrap();
         assert!(decrypted.is_empty());
     }
 

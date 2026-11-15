@@ -27,7 +27,7 @@ sh ./setup.sh
 
 ## Usage
 
-The program has two commands: `server` and `encrypt`. If you give no command, the program runs `server`.
+The program has three commands: `server`, `encrypt` and `decrypt`. If you give no command, the program runs `server`.
 
 ```sh
 cargo run -- --help
@@ -97,5 +97,19 @@ The output is base64 of `iv || ciphertext || tag`:
 - `iv`: 12 bytes. The HSM makes a new random IV for each call. You cannot set it.
 - `ciphertext`: the same length as the plaintext.
 - `tag`: 16 bytes. It authenticates the data.
+
+If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.
+
+### `decrypt`
+
+Decrypts the output of `encrypt` inside the HSM. The command reads the base64 text from STDIN and writes the plaintext to STDOUT. The `--key-id` option is required. It must be the label of the AES key that `encrypt` used.
+
+```sh
+printf 'hello world' | cargo run -- encrypt --key-id example-aes | cargo run -- decrypt --key-id example-aes
+```
+
+The command ignores spaces and newlines around the input. It writes the plaintext bytes exactly as they were. It does not add a newline.
+
+AES-GCM checks the tag. The command fails if you use the wrong key or if someone changed the data. It also fails if the input is not valid base64 or is shorter than 28 bytes (the IV and the tag).
 
 If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.

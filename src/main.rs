@@ -1,6 +1,7 @@
 //! A simple HTTP service that signs payloads using a hardware security module (HSM).
 
 use std::io::Read;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -165,6 +166,13 @@ enum Command {
         #[arg(long)]
         key_id: String,
     },
+    /// Decrypt the base64 output of `encrypt` (read from STDIN) inside the
+    /// HSM. Write the plaintext bytes to STDOUT.
+    Decrypt {
+        /// The label of the AES key in the token.
+        #[arg(long)]
+        key_id: String,
+    },
 }
 
 #[tokio::main]
@@ -173,6 +181,45 @@ async fn main() {
     match cli.command.unwrap_or(Command::Server) {
         Command::Server => run_server().await,
         Command::Encrypt { key_id } => run_encrypt(&key_id),
+        Command::Decrypt { key_id } => run_decrypt(&key_id),
+    }
+}
+
+/// Read STDIN, base64-decode it, decrypt it with the AES key `key_id` and write
+/// the plaintext bytes to STDOUT. Surrounding whitespace in the input is
+/// ignored. Errors go to STDERR and the process exits with code 1.
+fn run_decrypt(key_id: &str) {
+    let config = Config::try_from_env().unwrap_or_else(|err| {
+        eprintln!("Error loading configuration: {err}");
+        std::process::exit(1);
+    });
+
+    let mut input = Vec::new();
+    if let Err(err) = std::io::stdin().read_to_end(&mut input) {
+        eprintln!("Error reading STDIN: {err}");
+        std::process::exit(1);
+    }
+    let encrypted = BASE64.decode(input.trim_ascii()).unwrap_or_else(|err| {
+        eprintln!("Error: STDIN is not valid base64: {err}");
+        std::process::exit(1);
+    });
+
+    let hsm_backend = hsm_backend::CryptokiBackend::try_new(&config).unwrap_or_else(|err| {
+        eprintln!("Error initializing HSM backend: {err}");
+        std::process::exit(1);
+    });
+
+    let plaintext = hsm_backend
+        .decrypt(key_id, &encrypted)
+        .unwrap_or_else(|err| {
+            eprintln!("Error decrypting: {err}");
+            std::process::exit(1);
+        });
+
+    let mut stdout = std::io::stdout().lock();
+    if let Err(err) = stdout.write_all(&plaintext).and_then(|()| stdout.flush()) {
+        eprintln!("Error writing STDOUT: {err}");
+        std::process::exit(1);
     }
 }
 
