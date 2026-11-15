@@ -52,17 +52,53 @@ struct PhaseResults {
     elapsed: Duration,
 }
 
-impl PhaseResults {
-    /// The latencies of the successful requests in milliseconds, from the
-    /// smallest to the largest.
-    fn latencies_ms(&self) -> Vec<f64> {
-        let mut latencies_ms: Vec<f64> = self
-            .latencies
+/// The report for one phase. The latencies are those of the successful
+/// requests, in milliseconds. They are `None` if no request succeeded. The
+/// error rate is a percentage. It is `None` if there were no requests.
+struct Report {
+    total_requests: u64,
+    failed_requests: u64,
+    /// How long the phase took.
+    elapsed: Duration,
+    error_rate: Option<f64>,
+    min: Option<f64>,
+    p50: Option<f64>,
+    p95: Option<f64>,
+    p99: Option<f64>,
+    max: Option<f64>,
+}
+
+impl From<PhaseResults> for Report {
+    /// Sort the latencies, convert them to milliseconds and compute the
+    /// percentiles and the error rate.
+    fn from(results: PhaseResults) -> Self {
+        let mut latencies = results.latencies;
+        latencies.sort();
+        let sorted: Vec<f64> = latencies
             .iter()
             .map(|latency| latency.as_secs_f64() * 1000.0)
             .collect();
-        latencies_ms.sort_by(f64::total_cmp);
-        latencies_ms
+        Report {
+            total_requests: results.total_requests,
+            failed_requests: results.failed_requests,
+            elapsed: results.elapsed,
+            error_rate: (results.total_requests > 0)
+                .then(|| results.failed_requests as f64 / results.total_requests as f64 * 100.0),
+            min: sorted.first().copied(),
+            p50: Report::percentile(&sorted, 50.0),
+            p95: Report::percentile(&sorted, 95.0),
+            p99: Report::percentile(&sorted, 99.0),
+            max: sorted.last().copied(),
+        }
+    }
+}
+
+impl Report {
+    /// The percentile `p` (0 to 100) of the sorted values, by the nearest-rank
+    /// method. Return `None` if there are no values.
+    fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
+        let rank = (p / 100.0 * sorted.len() as f64).ceil() as usize;
+        sorted.get(rank.max(1) - 1).copied()
     }
 }
 
@@ -102,41 +138,30 @@ fn run_phase(agent: &ureq::Agent, url: &str, request: &Value, duration: Duration
     }
 }
 
-/// The percentile `p` (0 to 100) of the sorted values, by the nearest-rank
-/// method. The values must not be empty.
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    let rank = (p / 100.0 * sorted.len() as f64).ceil() as usize;
-    sorted[rank.clamp(1, sorted.len()) - 1]
-}
-
 /// Print the report for the measured phase.
-fn report(phase: &PhaseResults) {
-    let PhaseResults {
+fn print_report(report: &Report) {
+    let Report {
         total_requests,
         failed_requests,
         elapsed,
         ..
-    } = phase;
-    let latencies_ms = phase.latencies_ms();
-    let ok = latencies_ms.len();
+    } = report;
+    let ok = total_requests - failed_requests;
 
     println!("requests: {total_requests} (ok {ok}, errors {failed_requests})");
-    if *total_requests > 0 {
-        let error_rate = *failed_requests as f64 / *total_requests as f64 * 100.0;
+    if let Some(error_rate) = report.error_rate {
         println!("error rate: {error_rate:.2}%");
     }
-    if ok == 0 {
+    let (Some(min), Some(p50), Some(p95), Some(p99), Some(max)) =
+        (report.min, report.p50, report.p95, report.p99, report.max)
+    else {
         println!("no successful requests, so there are no latencies");
         return;
-    }
+    };
     println!("throughput: {:.1} req/s", ok as f64 / elapsed.as_secs_f64());
     println!(
         "latency ms: min {:.2}  p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2}",
-        latencies_ms[0],
-        percentile(&latencies_ms, 50.0),
-        percentile(&latencies_ms, 95.0),
-        percentile(&latencies_ms, 99.0),
-        latencies_ms[ok - 1],
+        min, p50, p95, p99, max,
     );
 }
 
@@ -161,13 +186,13 @@ fn main() {
     );
 
     println!("measuring: {} s", args.duration_secs);
-    let phase = run_phase(
+    let report = Report::from(run_phase(
         &agent,
         &url,
         &request,
         Duration::from_secs(args.duration_secs),
-    );
-    report(&phase);
+    ));
+    print_report(&report);
 
     // The service stops when `service` is dropped.
 }
