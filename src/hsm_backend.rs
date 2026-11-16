@@ -90,11 +90,6 @@ pub trait HsmBackend: Send + Sync + 'static {
         signature: &[u8],
     ) -> Result<bool, HsmBackendError>;
 
-    /// Check whether the token holds an EC private key with the label `key_id`.
-    ///
-    /// The caller must validate `key_id` first. This method blocks.
-    fn key_exists(&self, key_id: &str) -> Result<bool, HsmBackendError>;
-
     /// Encrypt the plaintext with the AES key that has the label `key_id`,
     /// using AES-GCM inside the HSM.
     ///
@@ -269,12 +264,6 @@ fn find_public_key(session: &Session, key_id: &str) -> Result<ObjectHandle, HsmB
 }
 
 impl HsmBackend for CryptokiBackend {
-    fn key_exists(&self, key_id: &str) -> Result<bool, HsmBackendError> {
-        let session = self.session();
-        let handles = find_private_keys(&session, key_id).map_err(HsmBackendError::FindKey)?;
-        Ok(!handles.is_empty())
-    }
-
     /// Sign with `CKM_ECDSA_SHA256`. The HSM hashes the payload. The result is
     /// the signature in DER form (the HSM returns the raw `r || s`).
     fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
@@ -521,31 +510,18 @@ mod tests {
     }
 
     #[test]
-    fn key_exists_finds_a_key_by_its_label() {
-        let _lock = with_test_token();
-        generate_key_pair("example-key");
-        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
-
-        assert!(backend.key_exists("example-key").unwrap());
-    }
-
-    #[test]
-    fn key_exists_is_false_for_an_unknown_label() {
-        let _lock = with_test_token();
-        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
-
-        assert!(!backend.key_exists("no-such-key").unwrap());
-    }
-
-    #[test]
-    fn key_exists_needs_an_exact_label_match() {
+    fn sign_needs_an_exact_label_match() {
         let _lock = with_test_token();
         generate_key_pair("example-exact");
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
 
-        assert!(!backend.key_exists("example-exac").unwrap());
-        assert!(!backend.key_exists("EXAMPLE-EXACT").unwrap());
-        assert!(!backend.key_exists("example-exact ").unwrap());
+        for label in ["example-exac", "EXAMPLE-EXACT", "example-exact "] {
+            let result = backend.sign(label, b"hello world");
+            assert!(
+                matches!(result, Err(HsmBackendError::KeyNotFound(_))),
+                "label {label:?}: unexpected: {result:?}"
+            );
+        }
     }
 
     /// Read the public key of the pair with the given label from the test token.

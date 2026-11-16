@@ -111,19 +111,10 @@ where
     let backend_state = Arc::clone(&state);
     let key_id = request.key_id.clone();
     let signature = tokio::task::spawn_blocking(move || {
-        let backend = &backend_state.hsm_backend;
-        // The key can still disappear before `sign` runs. Then `sign` returns
-        // `KeyNotFound` and the client gets the same error.
-        if !backend
-            .key_exists(&key_id)
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-        {
-            return Err(ApiError::KeyNotFound);
-        }
-        backend
+        backend_state
+            .hsm_backend
             .sign(&key_id, &decoded_payload)
             .map_err(|e| match e {
-                // The key was removed after `key_exists` found it.
                 HsmBackendError::KeyNotFound(_) => ApiError::KeyNotFound,
                 e => ApiError::Internal(e.to_string()),
             })
@@ -162,11 +153,6 @@ mod tests {
 
         let mut backend = MockHsmBackend::new();
         backend
-            .expect_key_exists()
-            .withf(|key_id| key_id == "example")
-            .times(1)
-            .returning(|_| Ok(true));
-        backend
             .expect_sign()
             .withf(|key_id, payload| key_id == "example" && payload == b"hello world")
             .times(1)
@@ -192,7 +178,6 @@ mod tests {
 
         // The payload is rejected before the backend is called.
         let mut backend = MockHsmBackend::new();
-        backend.expect_key_exists().never();
         backend.expect_sign().never();
 
         let result = handle_post_sign(state_with(backend), Json(request)).await;
@@ -217,10 +202,10 @@ mod tests {
     async fn handle_post_sign_unknown_key() {
         let mut backend = MockHsmBackend::new();
         backend
-            .expect_key_exists()
+            .expect_sign()
+            .withf(|key_id, _| key_id == "no-such-key")
             .times(1)
-            .returning(|_| Ok(false));
-        backend.expect_sign().never();
+            .returning(|key_id, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
 
         let err = handle_post_sign(state_with(backend), request("no-such-key"))
             .await
@@ -234,13 +219,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_post_sign_key_lookup_fails() {
+    async fn handle_post_sign_sign_fails() {
         let mut backend = MockHsmBackend::new();
         backend
-            .expect_key_exists()
+            .expect_sign()
             .times(1)
-            .returning(|_| Err(HsmBackendError::TokenNotFound("secret-detail".into())));
-        backend.expect_sign().never();
+            .returning(|_, _| Err(HsmBackendError::AmbiguousKey("secret-detail".into())));
 
         let err = handle_post_sign(state_with(backend), request("example"))
             .await
@@ -253,42 +237,5 @@ mod tests {
             err.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
-    }
-
-    #[tokio::test]
-    async fn handle_post_sign_key_removed_before_signing() {
-        let mut backend = MockHsmBackend::new();
-        backend.expect_key_exists().times(1).returning(|_| Ok(true));
-        backend
-            .expect_sign()
-            .times(1)
-            .returning(|key_id, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
-
-        let err = handle_post_sign(state_with(backend), request("example"))
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, ApiError::KeyNotFound), "got {err:?}");
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_post_sign_sign_fails() {
-        let mut backend = MockHsmBackend::new();
-        backend.expect_key_exists().times(1).returning(|_| Ok(true));
-        backend
-            .expect_sign()
-            .times(1)
-            .returning(|_, _| Err(HsmBackendError::AmbiguousKey("secret-detail".into())));
-
-        let err = handle_post_sign(state_with(backend), request("example"))
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, ApiError::Internal(_)), "got {err:?}");
-        assert_eq!(err.to_string(), "Internal error");
     }
 }

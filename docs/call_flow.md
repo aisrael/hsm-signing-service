@@ -16,7 +16,7 @@ flowchart TB
         axum["axum<br/>axum::serve + Router"]
         handler["api::handle_post_sign"]
         state["AppState&lt;B&gt;<br/>Arc, shared by all requests"]
-        trait{{"trait HsmBackend<br/>sign, key_exists, ..."}}
+        trait{{"trait HsmBackend<br/>sign, verify, encrypt, ..."}}
         cryptoki["CryptokiBackend<br/>Mutex&lt;Session&gt;"]
         mock["MockHsmBackend<br/>unit tests only"]
         module["cryptoki crate<br/>PKCS#11 module, loaded once"]
@@ -66,22 +66,17 @@ sequenceDiagram
         Handler-->>Client: 400 {"error": "Unable to base64 decode payload: ..."}
     end
     Handler->>Pool: spawn_blocking(closure)
-    Pool->>Backend: key_exists(key_id)
+    Pool->>Backend: sign(key_id, payload)
     Backend->>Backend: Lock the session Mutex
     Backend->>Cryptoki: find_objects(private key, EC, label = key_id)
     Cryptoki->>HSM: C_FindObjects
     HSM-->>Cryptoki: object handles
     Cryptoki-->>Backend: handles
-    Backend-->>Pool: Ok(true or false)
     alt no private key has this label
-        Pool-->>Handler: Err(KeyNotFound)
+        Backend-->>Pool: Err(KeyNotFound)
+        Pool-->>Handler: Err(ApiError::KeyNotFound)
         Handler-->>Client: 422 {"error": "Key not found"}
     end
-    Pool->>Backend: sign(key_id, payload)
-    Backend->>Backend: Lock the session Mutex again
-    Backend->>Cryptoki: find_objects(private key, EC, label = key_id)
-    Cryptoki->>HSM: C_FindObjects
-    HSM-->>Cryptoki: exactly one handle
     Backend->>Cryptoki: sign(CKM_ECDSA_SHA256, key, payload)
     Cryptoki->>HSM: C_SignInit + C_Sign
     HSM->>HSM: Hash the payload with SHA-256<br/>and sign it with the private key
