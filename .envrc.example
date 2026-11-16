@@ -29,3 +29,8 @@ export HSM_SIGNING_SERVICE_PORT="8080"
 # SIGTERM. The server exits with code 1 if requests are still running after
 # this time. Use a whole number of 1 or more.
 export HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS="30"
+
+# How many HSM sessions the server keeps in its session pool. Use a whole
+# number of 1 or more. If you do not set it, the server uses one session. (The
+# server does not use this setting yet.)
+export HSM_SIGNING_SERVICE_SESSION_POOL_SIZE="10"

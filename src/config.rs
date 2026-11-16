@@ -24,6 +24,11 @@ pub enum ConfigError {
         "HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS must be a whole number of seconds, 1 or more: {0}"
     )]
     InvalidShutdownTimeout(String),
+    /// The HSM_SIGNING_SERVICE_SESSION_POOL_SIZE is not a whole number of 1 or more
+    #[error(
+        "HSM_SIGNING_SERVICE_SESSION_POOL_SIZE must be a whole number of 1 or more, or not set: {0}"
+    )]
+    InvalidSessionPoolSize(String),
     /// The PKCS11_MODULE variable points to a file that does not exist or is not readable
     #[error("PKCS11_MODULE file not found or not readable: {0}")]
     Pkcs11ModuleNotFound(String),
@@ -37,6 +42,9 @@ pub struct Config {
     port: u16,
     /// How long the server waits for running requests after a shutdown signal.
     shutdown_timeout: Duration,
+    /// The number of HSM sessions in the session pool. `None` means no pool:
+    /// the service uses a single session.
+    session_pool_size: Option<u32>,
     /// The path to the HSM PKCS#11 library
     pkcs11_module: String,
     /// The label of the token. `setup.sh` uses the same label for the key.
@@ -60,6 +68,15 @@ fn parse_shutdown_timeout(raw: String) -> Result<Duration, ConfigError> {
     match raw.parse::<u64>() {
         Ok(secs) if secs >= 1 => Ok(Duration::from_secs(secs)),
         _ => Err(ConfigError::InvalidShutdownTimeout(raw)),
+    }
+}
+
+/// Parse the session pool size: a whole number of 1 or more. Zero is not
+/// valid, because a pool without sessions cannot sign.
+fn parse_session_pool_size(raw: String) -> Result<u32, ConfigError> {
+    match raw.parse::<u32>() {
+        Ok(size) if size >= 1 => Ok(size),
+        _ => Err(ConfigError::InvalidSessionPoolSize(raw)),
     }
 }
 
@@ -95,6 +112,17 @@ fn try_read_from_env_with_default(
     }
 }
 
+/// Read an optional environment variable that has no default.
+///
+/// Returns `None` if the variable is not set. A variable that is set must
+/// still be valid unicode and not empty, so a mistake is never hidden.
+fn try_read_optional_from_env(name: &'static str) -> Result<Option<String>, ConfigError> {
+    match try_read_from_env(name) {
+        Err(ConfigError::EnvVarNotSet(_)) => Ok(None),
+        result => result.map(Some),
+    }
+}
+
 impl Config {
     pub fn try_from_env() -> Result<Self, ConfigError> {
         let host = try_read_from_env_with_default(
@@ -112,6 +140,10 @@ impl Config {
             "HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS",
             DEFAULT_SHUTDOWN_TIMEOUT_SECS,
         )?)?;
+        let session_pool_size =
+            try_read_optional_from_env("HSM_SIGNING_SERVICE_SESSION_POOL_SIZE")?
+                .map(parse_session_pool_size)
+                .transpose()?;
         let pkcs11_module = try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)?;
 
         if !file_is_readable(&pkcs11_module) {
@@ -125,6 +157,7 @@ impl Config {
             host,
             port,
             shutdown_timeout,
+            session_pool_size,
             pkcs11_module,
             token_label,
             hsm_pin,
@@ -142,6 +175,7 @@ impl Config {
                 .expect("the default port is valid"),
             shutdown_timeout: parse_shutdown_timeout(DEFAULT_SHUTDOWN_TIMEOUT_SECS.into())
                 .expect("the default shutdown timeout is valid"),
+            session_pool_size: None,
             pkcs11_module: try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)
                 .expect("PKCS11_MODULE is valid"),
             token_label: token_label.into(),
@@ -156,6 +190,14 @@ impl Config {
     /// How long to wait for running requests after a shutdown signal.
     pub fn shutdown_timeout(&self) -> Duration {
         self.shutdown_timeout
+    }
+
+    /// The number of sessions in the session pool, or `None` for no pool (a
+    /// single session).
+    // Nothing reads this yet. Remove the attribute when the pool uses it.
+    #[allow(dead_code)]
+    pub fn session_pool_size(&self) -> Option<u32> {
+        self.session_pool_size
     }
 
     pub fn pkcs11_module(&self) -> &str {
@@ -294,6 +336,52 @@ mod tests {
     fn default_shutdown_timeout_is_valid() {
         let config = Config::for_test("example", "0000");
         assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn optional_read_returns_the_value_when_set() {
+        set("CONFIG_TEST_OPTIONAL_VALUE", "value");
+        let result = try_read_optional_from_env("CONFIG_TEST_OPTIONAL_VALUE");
+        assert_eq!(result.unwrap().as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn optional_read_returns_none_when_not_set() {
+        let result = try_read_optional_from_env("CONFIG_TEST_OPTIONAL_NOT_SET");
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn optional_read_fails_when_empty() {
+        set("CONFIG_TEST_OPTIONAL_EMPTY", "");
+        let result = try_read_optional_from_env("CONFIG_TEST_OPTIONAL_EMPTY");
+        assert!(matches!(
+            result,
+            Err(ConfigError::EnvVarEmpty("CONFIG_TEST_OPTIONAL_EMPTY"))
+        ));
+    }
+
+    #[test]
+    fn session_pool_size_accepts_a_whole_number_of_1_or_more() {
+        assert_eq!(parse_session_pool_size("1".into()).unwrap(), 1);
+        assert_eq!(parse_session_pool_size("10".into()).unwrap(), 10);
+    }
+
+    #[test]
+    fn session_pool_size_rejects_other_values() {
+        for raw in ["0", "abc", "-5", "1.5", "4294967296", " 5"] {
+            let result = parse_session_pool_size(raw.into());
+            assert!(
+                matches!(&result, Err(ConfigError::InvalidSessionPoolSize(value)) if value == raw),
+                "{raw:?}: unexpected {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn there_is_no_session_pool_by_default() {
+        let config = Config::for_test("example", "0000");
+        assert_eq!(config.session_pool_size(), None);
     }
 
     #[test]
