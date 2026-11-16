@@ -30,6 +30,17 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
+    /// The name of the algorithm in the API (for example `ECDSA_P256_SHA256`).
+    /// Also used as the `algorithm` attribute of the spans.
+    pub fn name(self) -> &'static str {
+        match self {
+            Algorithm::EcdsaP256Sha256 => "ECDSA_P256_SHA256",
+            Algorithm::EcdsaP384Sha384 => "ECDSA_P384_SHA384",
+            Algorithm::EcdsaP521Sha512 => "ECDSA_P521_SHA512",
+            Algorithm::RsaPkcs1Sha256 => "RSA_PKCS1_SHA256",
+        }
+    }
+
     /// The PKCS#11 mechanism that signs and verifies for this algorithm.
     pub fn mechanism(self) -> Mechanism<'static> {
         match self {
@@ -88,6 +99,19 @@ mod tests {
         for (algorithm, name) in names {
             assert_eq!(serde_json::to_string(&algorithm).unwrap(), name);
             assert_eq!(serde_json::from_str::<Algorithm>(name).unwrap(), algorithm);
+        }
+    }
+
+    #[test]
+    fn name_is_the_name_in_json() {
+        for algorithm in [
+            Algorithm::EcdsaP256Sha256,
+            Algorithm::EcdsaP384Sha384,
+            Algorithm::EcdsaP521Sha512,
+            Algorithm::RsaPkcs1Sha256,
+        ] {
+            let json = serde_json::to_string(&algorithm).unwrap();
+            assert_eq!(json, format!("\"{}\"", algorithm.name()));
         }
     }
 

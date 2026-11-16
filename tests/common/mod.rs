@@ -160,3 +160,53 @@ impl Drop for Service {
         let _ = std::fs::remove_file(&self.stderr_path);
     }
 }
+
+/// The service that a benchmark sends its requests to: either a copy that the
+/// benchmark starts itself, or a service that is already running.
+pub enum Target {
+    /// A service that the benchmark started. It stops when the target is dropped.
+    Spawned(Service),
+    /// A running service. The benchmark does not start it and does not stop it.
+    External(String),
+}
+
+impl Target {
+    /// Use the running service at `external_url` (for example
+    /// `http://localhost:8080`) if there is one. Otherwise start a new service
+    /// on a free port.
+    ///
+    /// Panic with a clear message if the URL is not an `http://` URL, or if
+    /// the service does not answer `GET /healthz`. A benchmark of a service
+    /// that is not there has no meaning.
+    pub fn connect(external_url: Option<&str>) -> Self {
+        let Some(url) = external_url else {
+            return Target::Spawned(Service::start());
+        };
+        let base = url.trim().trim_end_matches('/');
+        assert!(
+            base.starts_with("http://"),
+            "the service URL must start with http:// (got {url:?})"
+        );
+        let healthz = format!("{base}/healthz");
+        ureq::get(&healthz).call().unwrap_or_else(|err| {
+            panic!("no service answers at {healthz}: {err}. Start it, or do not set the URL")
+        });
+        Target::External(base.to_string())
+    }
+
+    /// The full URL of `path` on the service.
+    pub fn url(&self, path: &str) -> String {
+        match self {
+            Target::Spawned(service) => service.url(path),
+            Target::External(base) => format!("{base}{path}"),
+        }
+    }
+
+    /// A short description for the report.
+    pub fn describe(&self) -> String {
+        match self {
+            Target::Spawned(_) => "a new service, started by the benchmark".to_string(),
+            Target::External(base) => format!("the running service at {base}"),
+        }
+    }
+}

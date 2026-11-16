@@ -1,6 +1,8 @@
 //! A `criterion` benchmark for `POST /v1/sign`, to find regressions.
 //!
-//! The benchmark starts the compiled service as a child process and sends real
+//! The benchmark starts the compiled service as a child process (or, if the
+//! environment variable `HSM_SIGNING_SERVICE_URL` is set, uses the running
+//! service at that URL; `criterion` does not accept other options) and sends real
 //! HTTP requests with one caller, as the `custom_benchmark` benchmark does with
 //! one caller. Each request has a payload of random words (3 to 10 words). The
 //! payloads come from a fixed seed, so every run sends the same sequence.
@@ -24,7 +26,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use common::Service;
+use common::Target;
 use criterion::BatchSize;
 use criterion::Criterion;
 use criterion::criterion_group;
@@ -69,8 +71,10 @@ fn sign_once(agent: &ureq::Agent, url: &str, request: &Value) -> String {
 }
 
 fn bench_sign(c: &mut Criterion) {
-    let service = Service::start();
-    let url = service.url("/v1/sign");
+    let external_url = std::env::var("HSM_SIGNING_SERVICE_URL").ok();
+    let target = Target::connect(external_url.as_deref());
+    let url = target.url("/v1/sign");
+    eprintln!("target: {}", target.describe());
     let key_id = common::env_var("HSM_TOKEN_LABEL");
     let agent = ureq::Agent::new_with_defaults();
     let mut rng = StdRng::seed_from_u64(SEED);
@@ -84,7 +88,7 @@ fn bench_sign(c: &mut Criterion) {
         );
     });
 
-    // The service stops when `service` is dropped.
+    // A service that the benchmark started stops when `target` is dropped.
 }
 
 criterion_group! {

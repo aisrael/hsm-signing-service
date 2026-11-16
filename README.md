@@ -120,6 +120,51 @@ The `algorithm` field chooses the mechanism. The HSM hashes the payload. The key
 | `EXPORTABLE_KEY_LABEL` | Setup only | The label of the EC P-256 key pair that `wrap` wraps. `setup.sh` creates it. |
 | `P384_KEY_LABEL`, `P521_KEY_LABEL`, `RSA_KEY_LABEL` | Setup and tests | The labels of the EC P-384, EC P-521 and RSA 2048 key pairs. `setup.sh` creates them, and the integration tests use them. |
 
+## Tracing
+
+The service can send traces to an OpenTelemetry collector over OTLP (gRPC). It is off by default. It is on when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, for example `http://localhost:4317`. The SDK also reads the other standard variables: `OTEL_SERVICE_NAME` (default `hsm-signing-service`), `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG`.
+
+Each `POST /v1/sign` request makes one trace:
+
+```
+POST /v1/sign                 server span; joins the trace of the `traceparent` header
+└─ handle_post_sign           attribute `outcome`
+   └─ sign_blocking           attributes `algorithm`, `key_id`
+      ├─ pool_checkout        wait for a free session (pool only)
+      └─ hsm_sign             the PKCS#11 sign call only
+```
+
+- `outcome` is one of `ok`, `bad_request`, `key_not_found`, `internal`, `timeout`. The spans for `internal` and `timeout` have the status `Error`.
+- A request that gets `503` has only the `POST /v1/sign` span, with `rejected=true`.
+- A long `pool_checkout` with a flat `hsm_sign` means the pool is too small. A long `hsm_sign` means the HSM is the limit.
+- Spans never hold the payload, the signature or the PIN.
+- When the service stops, it sends the spans that wait in the queue (at most 5 seconds).
+
+To try it on your machine, start a local Grafana `otel-lgtm` with Podman:
+
+```sh
+podman compose up -d
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run
+```
+
+Open Grafana at <http://localhost:3000> (user `admin`, password `admin`), go to Explore, choose the Tempo data source and run `{ resource.service.name = "hsm-signing-service" }`. The compose file keeps no data between runs.
+
+### Metrics
+
+The same OTLP connection also carries three application metrics. There is no `/metrics` endpoint. They need the pool for the last two (without `HSM_SIGNING_SERVICE_SESSION_POOL_SIZE`, only `requests.in_flight` is reported).
+
+| Metric (in Prometheus) | Kind | Meaning |
+| --- | --- | --- |
+| `hsm_signing_requests_in_flight` | gauge | Requests in the service. A request that gets `503` is not counted. |
+| `hsm_signing_pool_sessions_in_use` | gauge | HSM sessions taken from the pool now. |
+| `hsm_signing_pool_size` | gauge | The number of sessions of the pool (a constant). |
+
+The queue length is `hsm_signing_requests_in_flight - hsm_signing_pool_sessions_in_use`. The pool is full when `hsm_signing_pool_sessions_in_use == hsm_signing_pool_size`. The service sends metrics every 10 seconds. Set `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds) to change this. Because the values are sampled at each export, use `max_over_time(hsm_signing_pool_sessions_in_use[1m])` to see peaks between two exports.
+
+To see the metrics in Grafana, go to Explore and choose the Prometheus data source.
+
+To see many traces, run a benchmark against the running service (see [Benchmarks](#benchmarks)): `cargo bench --bench custom_benchmark -- --hsm-signing-service-url http://localhost:8080 -C 10`. `otel-lgtm` also makes metrics from the spans (`traces_spanmetrics_calls_total` and `traces_spanmetrics_latency_*` in the Prometheus data source), so you get request rates and latency percentiles with no metrics code in the service.
+
 ## Container image
 
 The `Dockerfile` builds the service with SoftHSM 2.7.0 (built from source, because the Debian package is too old, see the SoftHSM version in [Setup](#setup)). The commands work with `docker` and with `podman`.
@@ -193,6 +238,15 @@ cargo bench --bench custom_benchmark -- --warmup-secs 5 --duration-secs 30 --see
 | `--duration-secs <N>` | `30` | How long the measured phase runs, in seconds. |
 | `-C`, `--concurrency <N>` | `1` | The number of concurrent callers, from 1 to 1000. Repeat the option or separate the values with commas to run several levels one after another. `-C 1 -C 10` is the same as `--concurrency 1,10`. |
 | `--seed <N>` | none | Seeds the random number generators, so a run can send the same payloads again. Without a seed, every run uses different payloads. |
+| `--hsm-signing-service-url <URL>` | none | The base URL of a running service, for example `http://localhost:8080`. The benchmark checks `GET /healthz`, sends its requests there and does not start or stop a service. Without it, the benchmark starts its own service. The running service must have the key with the label `HSM_TOKEN_LABEL`. |
+
+To benchmark a running service (for example one that sends traces to Grafana, see [Tracing](#tracing)), give its URL:
+
+```sh
+cargo bench --bench custom_benchmark -- --hsm-signing-service-url http://localhost:8080 -C 10
+```
+
+The benchmark then measures that service with its real settings (pool size, queue size, tracing). Only `http://` URLs work. If the service does not answer, the benchmark stops with an error.
 
 Notes:
 
@@ -203,6 +257,8 @@ Notes:
 ### `criterion_benchmark`
 
 Finds regressions. It sends the same requests with one caller and uses [criterion](https://crates.io/crates/criterion) to measure the time of one request and to compare it with an earlier run. The payloads come from a fixed seed, so every run sends the same sequence. A request that fails stops the benchmark.
+
+To use a running service, set the environment variable `HSM_SIGNING_SERVICE_URL` (for example `HSM_SIGNING_SERVICE_URL=http://localhost:8080`). `criterion` does not accept other command line options.
 
 Save a baseline, change the code, then compare:
 
@@ -247,7 +303,7 @@ cargo bench --bench criterion_benchmark -- --baseline before
 ### Performance and testing
 
 - SoftHSM may do signing one call at a time inside the library, so a bigger session pool may not raise throughput. We have not proven where the bottleneck is.
-- The service cannot scale itself. It has no metrics endpoint, so an autoscaler has no signal to use. With SoftHSM, you also cannot add instances, because one token volume serves one instance.
+- The service cannot scale itself. It has no metrics endpoint (it sends traces only), so an autoscaler has no signal to use. With SoftHSM, you also cannot add instances, because one token volume serves one instance.
 - The recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)) ran once for each configuration, on a machine that was not fully quiet. It does not count `503` and `504` errors separately, and it uses only `ECDSA_P256_SHA256`.
 - CI runs only the unit tests and skips the tests that need a token. It does not build the container image.
 
@@ -280,7 +336,7 @@ This project is a prototype. Before you use the design in production, think abou
 
 - **Health:** `GET /healthz` is a liveness check only. Add a readiness check, for example one that returns `503` when the service rejects requests, and a check that calls the HSM.
 - **Shutdown:** Set `HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS` lower than the grace period of the orchestrator, so the service exits with a clear code before it is killed. Test a shutdown with a request in flight.
-- **Observability:** Add metrics for the number of sessions in use, the queue length, the `503` and `504` counts, and the signing latency. Add tracing across services.
+- **Observability:** Add metrics for the number of sessions in use, the queue length, the `503` and `504` counts, and the signing latency. The service sends traces (see [Tracing](#tracing)), but it has no metrics.
 - **Auto-scaling:** Make the service scale with the traffic. Emit metrics in the Prometheus format (a `/metrics` endpoint) that an autoscaler can use, for example a KEDA `ScaledObject` in Kubernetes. Good signals are the number of requests in the service, the queue length, the rate of `503` answers, and the signing latency. Set a minimum number of instances for availability, and a maximum number that the HSM can serve: the number of instances times the pool size must stay under the session limit of the HSM. Scale up fast and scale down slowly, because a new instance must connect to the HSM and log in before it can serve requests, and a readiness check must tell the autoscaler when it is ready.
 - **Tuning:** Set the pool size, the queue size and the pool timeout from a benchmark on the real HSM, from a clean build on a quiet machine. Count `503` and `504` separately.
 - **CI:** Run the integration tests and build the container image in CI.

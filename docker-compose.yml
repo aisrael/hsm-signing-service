@@ -1,0 +1,17 @@
+# A local OpenTelemetry back end, to check that the service sends traces.
+# For local development and tests only: it keeps no data between runs.
+#
+#   podman compose up -d
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run
+#
+# Open Grafana at http://localhost:3000 (user admin, password admin), go to
+# Explore, choose the Tempo data source and query:
+#   { resource.service.name = "hsm-signing-service" }
+services:
+  otel-lgtm:
+    image: grafana/otel-lgtm
+    container_name: otel-lgtm
+    ports:
+      - "3000:3000" # Grafana UI
+      - "4317:4317" # OTLP over gRPC
+      - "4318:4318" # OTLP over HTTP

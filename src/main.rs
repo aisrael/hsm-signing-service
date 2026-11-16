@@ -7,6 +7,8 @@ mod cli;
 mod config;
 mod errors;
 mod hsm_backend;
+mod metrics;
+mod telemetry;
 mod utils;
 
 #[tokio::main]

@@ -15,6 +15,8 @@ use tokio::signal::unix::SignalKind;
 use tokio::signal::unix::signal;
 use tokio::sync::oneshot;
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::algorithm::Algorithm;
 use crate::api;
@@ -23,6 +25,9 @@ use crate::app_state::AppState;
 use crate::config::Config;
 use crate::hsm_backend;
 use crate::hsm_backend::HsmBackend;
+use crate::metrics::Metrics;
+use crate::telemetry;
+use crate::telemetry::TelemetryGuard;
 
 const CRATE_VERSION: &str = crate_version!();
 
@@ -222,13 +227,36 @@ fn do_encrypt(key_id: &str) {
 }
 
 /// Install the log subscriber. The level comes from `RUST_LOG` (default `info`).
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+///
+/// If `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the spans also go to the OTLP
+/// collector. The caller must call `shutdown` on the returned guard before the
+/// process ends. A failure to set up the exporter is printed, and the service
+/// runs without telemetry: signing must not stop because of it.
+fn init_tracing() -> Option<TelemetryGuard> {
+    let (guard, otel_layer) = match telemetry::init() {
+        Ok(Some((guard, tracer))) => (
+            Some(guard),
+            Some(tracing_opentelemetry::layer().with_tracer(tracer)),
+        ),
+        Ok(None) => (None, None),
+        Err(err) => {
+            eprintln!("Error setting up telemetry, continuing without it: {err}");
+            (None, None)
+        }
+    };
+
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
-        .with_span_events(FmtSpan::CLOSE)
+        .with(tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE))
+        .with(otel_layer)
         .init();
+
+    if guard.is_some() {
+        tracing::info!("sending traces to the OTLP collector");
+    }
+    guard
 }
 
 /// Run the HTTP signing service until the process stops.
@@ -241,7 +269,11 @@ async fn run_server() {
     });
 
     // Start logging before the backend, so its start-up messages are written.
-    init_tracing();
+    let telemetry = init_tracing();
+    // Real instruments if telemetry is on. Otherwise they record nothing.
+    let metrics = telemetry
+        .as_ref()
+        .map_or_else(Metrics::noop, |telemetry| Metrics::new(&telemetry.meter()));
 
     // With a session pool size, the service uses a pool of sessions. Without
     // one, it uses a single session.
@@ -252,8 +284,9 @@ async fn run_server() {
                     .unwrap_or_else(|err| {
                         eprintln!("Error initializing HSM backend: {err}");
                         std::process::exit(1);
-                    });
-            serve(config, hsm_backend).await
+                    })
+                    .with_metrics(&metrics);
+            serve(config, hsm_backend, telemetry, metrics).await
         }
         None => {
             let hsm_backend =
@@ -261,20 +294,27 @@ async fn run_server() {
                     eprintln!("Error initializing HSM backend: {err}");
                     std::process::exit(1);
                 });
-            serve(config, hsm_backend).await
+            serve(config, hsm_backend, telemetry, metrics).await
         }
     }
 }
 
-/// Serve the API with the given HSM backend until the process stops.
-async fn serve<B>(config: Config, hsm_backend: B)
-where
+/// Serve the API with the given HSM backend until the process stops. Then send
+/// the spans that are still in the queue of the exporter.
+async fn serve<B>(
+    config: Config,
+    hsm_backend: B,
+    telemetry: Option<TelemetryGuard>,
+    metrics: Metrics,
+) where
     B: HsmBackend,
 {
-    let app_state = AppState::try_new(&config, hsm_backend).unwrap_or_else(|err| {
-        eprintln!("Error initializing application state: {err}");
-        std::process::exit(1);
-    });
+    let app_state = AppState::try_new(&config, hsm_backend)
+        .unwrap_or_else(|err| {
+            eprintln!("Error initializing application state: {err}");
+            std::process::exit(1);
+        })
+        .with_metrics(metrics);
 
     let state = Arc::new(app_state);
 
@@ -310,12 +350,19 @@ where
         result = server => {
             result.expect("server error");
             tracing::info!("shut down");
+            if let Some(telemetry) = telemetry {
+                telemetry.shutdown();
+            }
         }
         () = drain_timer => {
             tracing::warn!(
                 "requests still running after {} seconds, exiting",
                 drain_timeout.as_secs()
             );
+            // Keep the spans of the slow requests: they are the interesting ones.
+            if let Some(telemetry) = telemetry {
+                telemetry.shutdown();
+            }
             std::process::exit(1);
         }
     }
