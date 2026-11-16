@@ -11,6 +11,8 @@ Required tools:
 - softhsm2-util ([`brew install softhsm`](https://formulae.brew.sh/formula/softhsm))
 - pkcs11-tool ([`brew install opensc`](https://formulae.brew.sh/formula/opensc))
 
+**SoftHSM version:** Use SoftHSM 2.7.0 or later. The `server` and `verify` commands sign and verify with the mechanism `CKM_ECDSA_SHA256`, which SoftHSM supports from 2.7.0 (the release notes say "Added support for ECDSA with hashing"). With an older version, such as 2.6.1 (the version in the Ubuntu package), signing fails with `MechanismInvalid`. To check your version, run `softhsm2-util --version`.
+
 ### Environment variables
 
 The setup script and the application itself require certain environment variables to be set.
@@ -173,3 +175,47 @@ The HSM wraps only a key that is extractable. `setup.sh` makes only `example-exp
 `wrap` supports EC private keys only. The program has no `unwrap` command.
 
 If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.
+
+## Benchmarks
+
+There are two benchmarks. Both start the compiled service as a child process on a free port. Then they send real `POST /v1/sign` requests over HTTP, with a random payload of 3 to 10 words. They sign with the real SoftHSM token, so they need the token, the key and the environment variables (see [Setup](#setup)). Cargo builds the service with the bench profile (optimized).
+
+Load the environment variables first. If you use `direnv`, they are already set. If not, load `.envrc` in a subshell, so the variables do not stay in your shell:
+
+```sh
+(set -a; . ./.envrc; set +a; cargo bench --bench custom_benchmark)
+```
+
+### `custom_benchmark`
+
+Measures throughput and latency for a number of concurrent callers. Each caller is a thread. It sends requests one after another on its own connection. For each level, a warm-up phase runs first, and its results are thrown away. Then the measured phase runs. The report shows the number of requests, the error rate, the throughput (successful requests per second) and the latency (minimum, p50, p95, p99 and maximum, in milliseconds).
+
+```sh
+cargo bench --bench custom_benchmark -- --warmup-secs 5 --duration-secs 30 --seed 42 -C 1 -C 10 -C 100 -C 500
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--warmup-secs <N>` | `5` | How long the warm-up phase runs, in seconds. |
+| `--duration-secs <N>` | `30` | How long the measured phase runs, in seconds. |
+| `-C`, `--concurrency <N>` | `1` | The number of concurrent callers, from 1 to 1000. Repeat the option or separate the values with commas to run several levels one after another. `-C 1 -C 10` is the same as `--concurrency 1,10`. |
+| `--seed <N>` | none | Seeds the random number generators, so a run can send the same payloads again. Without a seed, every run uses different payloads. |
+
+Notes:
+
+- Each caller sends its next request after the last one ends (a closed loop). When the service is slow, the callers wait, and this hides part of the queueing delay.
+- The client and the service run on one machine and share the CPU. SoftHSM is software, so its signing time is not the time of a real HSM.
+- Each caller needs a socket, and so does the service. For hundreds of callers, check the limit of open files in your shell (`ulimit -n`). If it is low (the macOS default is often 256), connection errors can look like service errors. Raise the limit before you run the benchmark, for example `ulimit -n 4096`.
+
+### `criterion_benchmark`
+
+Finds regressions. It sends the same requests with one caller and uses [criterion](https://crates.io/crates/criterion) to measure the time of one request and to compare it with an earlier run. The payloads come from a fixed seed, so every run sends the same sequence. A request that fails stops the benchmark.
+
+Save a baseline, change the code, then compare:
+
+```sh
+cargo bench --bench criterion_benchmark -- --save-baseline before
+cargo bench --bench criterion_benchmark -- --baseline before
+```
+
+`criterion` prints the time for each run and tells you if the time changed. It saves the results and an HTML report in `target/criterion`.
