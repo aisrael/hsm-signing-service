@@ -3,6 +3,44 @@ hsm-signing-service
 
 An exercise demonstrating how to interface with an HSM service (SoftHSM) and serve signing requests over an API, written in Rust.
 
+## Introduction
+
+This project is a REST service that signs data with a key that stays inside a hardware security module (HSM). A client sends `POST /v1/sign` with a key label and a payload. The HSM signs the payload with the requested algorithm, and the service returns the signature.
+
+### Architecture
+
+A request goes through three layers:
+
+```mermaid
+flowchart LR
+    client([Client]) --> axum["axum handler<br/>and middleware"]
+    axum --> backend["HsmBackend"]
+    backend --> softhsm[("SoftHSM")]
+```
+
+- **axum and middleware:** They own the HTTP endpoints. A middleware does the admission control. An HSM session is a scarce resource, so when too many requests are running or waiting, the middleware rejects new requests at once with `503`. The handlers do not talk to the HSM directly. They use the `HsmBackend` trait.
+- **`HsmBackend`:** This trait is the only way to reach the HSM. It has two implementations. One uses a single session. The other uses a pool of sessions, and it is used when you configure a pool size. A request that waits too long for a session gets `504`. The handler tests use a mock backend, so they need no HSM.
+- **SoftHSM:** It holds the token and the keys. It does the signing, so the private key never leaves it. A real HSM can replace it, because both use the PKCS#11 interface.
+
+For the component diagram and the sequence diagrams, see [docs/call_flow.md](docs/call_flow.md). For the decision about the limits, see [docs/adrs/001-implemented-max-concurrent-requests.md](docs/adrs/001-implemented-max-concurrent-requests.md). For the load tests, see [Benchmarks](#benchmarks). To run the service in a container, see [Container image](#container-image).
+
+### Concurrency and admission control
+
+An HSM session is a scarce resource, and an HSM call is slow compared to the rest of a request. Two features control how the service uses sessions:
+
+- **Session pool:** Without a pool, the service uses one session, so signing requests are done one at a time. With a pool several requests can be signed at the same time. A bigger pool can raise throughput only if the HSM can do the work in parallel. SoftHSM may not, so measure before you choose a size (see [Benchmarks](#benchmarks)). If all sessions are in use, a request waits for a free one for a short time. After that, it gets `504`.
+- **Admission control:** The service accepts only a fixed number of requests at the same time. The limit is the number of sessions plus the queue size. A request over the limit gets `503` with a `Retry-After` header at once, and it never reaches the HSM. With a queue size of `0`, no request waits.
+
+The effect is that the service does not slow down for everyone when the load is too high. Accepted requests wait only a short, bounded time. The excess load is rejected early and cheaply, and the client can try again.
+
+For the details of the decision, see [docs/adrs/001-implemented-max-concurrent-requests.md](docs/adrs/001-implemented-max-concurrent-requests.md).
+
+### Security Approaches
+
+- **Key management:** The HSM makes and keeps every key. `setup.sh` generates the keys inside the token, and we never import a key. The signing key and the AES key are not extractable, so a key never leaves the HSM in plain form. The only export is a demo key that `wrap` outputs encrypted under the AES key. The service finds a key by its label. It has no key rotation, backup or per-key access control (see the limitations).
+- **Secrets:** The service reads the PIN from an environment variable. The code does not log it, and the repository does not hold it.
+- **Access:** The endpoint has no authentication. Anyone who can reach it can sign with the keys in the token. The service listens on `127.0.0.1` by default. Keep it on a trusted network.
+
 ## Setup
 
 Required tools:
