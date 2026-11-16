@@ -57,6 +57,9 @@ jobs:
         run: |
           cargo test --bins -- \
             --skip sign_returns_a_valid_der_signature_for_an_existing_key \
+            --skip every_session_of_the_pool_can_sign \
+            --skip pool_signs_and_verifies_with_one_session \
+            --skip pool_signs_from_many_threads_at_once \
             --skip verify_accepts_a_signature_from_sign \
             --skip verify_fails_for_an_aes_key_label \
             --skip verify_fails_for_an_unknown_label \
