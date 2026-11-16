@@ -229,11 +229,34 @@ async fn run_server() {
         std::process::exit(1);
     });
 
-    let hsm_backend = hsm_backend::CryptokiBackend::try_new(&config).unwrap_or_else(|err| {
-        eprintln!("Error initializing HSM backend: {err}");
-        std::process::exit(1);
-    });
+    // With a session pool size, the service uses a pool of sessions. Without
+    // one, it uses a single session.
+    match config.session_pool_size() {
+        Some(pool_size) => {
+            let hsm_backend =
+                hsm_backend::CryptokiBackendWithSessionPool::try_new(&config, pool_size)
+                    .unwrap_or_else(|err| {
+                        eprintln!("Error initializing HSM backend: {err}");
+                        std::process::exit(1);
+                    });
+            serve(config, hsm_backend).await
+        }
+        None => {
+            let hsm_backend =
+                hsm_backend::CryptokiBackend::try_new(&config).unwrap_or_else(|err| {
+                    eprintln!("Error initializing HSM backend: {err}");
+                    std::process::exit(1);
+                });
+            serve(config, hsm_backend).await
+        }
+    }
+}
 
+/// Serve the API with the given HSM backend until the process stops.
+async fn serve<B>(config: Config, hsm_backend: B)
+where
+    B: HsmBackend,
+{
     let app_state = AppState::try_new(&config, hsm_backend).unwrap_or_else(|err| {
         eprintln!("Error initializing application state: {err}");
         std::process::exit(1);

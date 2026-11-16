@@ -194,8 +194,6 @@ impl Config {
 
     /// The number of sessions in the session pool, or `None` for no pool (a
     /// single session).
-    // Nothing reads this yet. Remove the attribute when the pool uses it.
-    #[allow(dead_code)]
     pub fn session_pool_size(&self) -> Option<u32> {
         self.session_pool_size
     }

@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod errors;
 mod hsm_backend;
+mod utils;
 
 #[tokio::main]
 async fn main() {

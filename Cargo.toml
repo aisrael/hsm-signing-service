@@ -9,6 +9,7 @@ base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["cargo", "derive"] }
 cryptoki = "0.12.1"
 p256 = "0.14.0"
+r2d2-cryptoki = "0.5.0"
 secrecy = "0.10.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
