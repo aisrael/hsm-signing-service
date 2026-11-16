@@ -10,8 +10,11 @@
 //! runs. The report shows the latency percentiles and the error rate.
 //!
 //! ```sh
-//! cargo bench --bench sign -- --warmup-secs 5 --duration-secs 30 --seed 42 -C 1 -C 10 -C 100 -C 500
+//! cargo bench --bench custom_benchmark -- --warmup-secs 5 --duration-secs 30 --seed 42 -C 1 -C 10 -C 100 -C 500
 //! ```
+//!
+//! The `criterion_benchmark` benchmark sends the same requests with one caller
+//! and uses `criterion` to find regressions.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
