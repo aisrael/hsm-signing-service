@@ -85,6 +85,8 @@ All commands read their settings from environment variables.
 
 For the arguments, the output, the error responses and the exit codes of each command, see [docs/commands.md](docs/commands.md).
 
+### POST /v1/sign
+
 ```sh
 cargo run -- server
 curl -X POST http://127.0.0.1:8080/v1/sign \
