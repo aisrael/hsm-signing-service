@@ -171,6 +171,8 @@ Notes:
 
 There are two benchmarks. Both start the compiled service as a child process on a free port. Then they send real `POST /v1/sign` requests over HTTP, with a random payload of 3 to 10 words. They sign with the real SoftHSM token, so they need the token, the key and the environment variables (see [Setup](#setup)). Cargo builds the service with the bench profile (optimized).
 
+For the results of the load tests and the limits of these results, see [docs/benchmarks.md](docs/benchmarks.md).
+
 Load the environment variables first. If you use `direnv`, they are already set. If not, load `.envrc` in a subshell, so the variables do not stay in your shell:
 
 ```sh
@@ -246,7 +248,7 @@ cargo bench --bench criterion_benchmark -- --baseline before
 
 - SoftHSM may do signing one call at a time inside the library, so a bigger session pool may not raise throughput. We have not proven where the bottleneck is.
 - The service cannot scale itself. It has no metrics endpoint, so an autoscaler has no signal to use. With SoftHSM, you also cannot add instances, because one token volume serves one instance.
-- The recorded benchmark ran on a busy machine, from a commit with uncommitted changes. It does not count `503` and `504` errors separately.
+- The recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)) ran on a busy machine. It does not count `503` and `504` errors separately.
 - CI runs only the unit tests and skips the tests that need a token. It does not build the container image.
 
 ## Production considerations
