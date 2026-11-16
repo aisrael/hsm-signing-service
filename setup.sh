@@ -32,10 +32,14 @@ fi
 
 ################################################################################
 # Check for required commands and exit with an error if they are not found.
-BREW=$(command -v brew 2>/dev/null)
-if [ -z "$BREW" ]; then
-    echo "Error: Homebrew not found. Install Homebrew (https://brew.sh/) and try again." >&2
-    exit 1
+# Homebrew is only needed to find the SoftHSM2 module when PKCS11_MODULE is not
+# set (the container image sets it).
+if [ -z "${PKCS11_MODULE:-}" ]; then
+    BREW=$(command -v brew 2>/dev/null)
+    if [ -z "$BREW" ]; then
+        echo "Error: PKCS11_MODULE is not set and Homebrew was not found. Set PKCS11_MODULE, or install Homebrew (https://brew.sh/) and try again." >&2
+        exit 1
+    fi
 fi
 
 SOFTHSM=$(command -v softhsm2-util 2>/dev/null)

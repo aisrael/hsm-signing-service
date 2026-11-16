@@ -181,6 +181,52 @@ The HSM wraps only a key that is extractable. `setup.sh` makes only `example-exp
 
 If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.
 
+## Container image
+
+The `Dockerfile` builds the service with SoftHSM 2.7.0 (built from source, because the Debian package is 2.6.1 and cannot sign with `CKM_ECDSA_SHA256`). The commands work with `docker` and with `podman`.
+
+The image has two targets:
+
+| Target | Content | Use |
+| --- | --- | --- |
+| `runtime` (default) | The service and the SoftHSM library. It runs as user `app` (UID 10001). | Run the service. |
+| `setup` | The runtime image, `softhsm2-util`, `pkcs11-tool` and `setup.sh`. | Create the token and keys, once. |
+
+The image holds no token, key or PIN. The token lives in the volume `/var/lib/softhsm/tokens`. You create it with the `setup` image, then the service uses the same volume.
+
+Build both images:
+
+```sh
+docker build -t example-hsm-signing-service .
+docker build --target setup -t example-hsm-signing-service-setup .
+```
+
+Create the token and keys in a named volume. The commands use the environment variables from `.envrc` (see [Environment variables](#environment-variables)). `-e NAME` passes the value from your shell and does not put it on the command line:
+
+```sh
+docker volume create example-hsm-tokens
+docker run --rm -v example-hsm-tokens:/var/lib/softhsm/tokens \
+  -e HSM_TOKEN_LABEL -e AES_KEY_LABEL -e EXPORTABLE_KEY_LABEL -e HSM_SO_PIN -e HSM_PIN \
+  example-hsm-signing-service-setup
+```
+
+Run the service on the same volume:
+
+```sh
+docker run --rm -p 127.0.0.1:8080:8080 -v example-hsm-tokens:/var/lib/softhsm/tokens \
+  -e HSM_TOKEN_LABEL -e HSM_PIN \
+  example-hsm-signing-service
+```
+
+Then send the request from the [`server`](#server) section to `http://127.0.0.1:8080/v1/sign`. You can set the other variables of the table above with more `-e` options. The `docker stop` command sends SIGTERM, and the service shuts down gracefully.
+
+Notes:
+
+- The image sets `HSM_SIGNING_SERVICE_HOST=0.0.0.0`, so the port is reachable from outside the container. The endpoint has no authentication. Publish the port only on a trusted interface (`127.0.0.1:` in the command above).
+- In a real deployment, give `HSM_PIN` to the container from a secret store (for example a Kubernetes `Secret`), not from a file in the repository. A real HSM replaces the volume: set `PKCS11_MODULE` to the library of the vendor.
+- The `setup` image runs `setup.sh`. It stops with an error if a key has wrong settings. It is safe to run again.
+- The image has no health check, because the service has no health endpoint.
+
 ## Benchmarks
 
 There are two benchmarks. Both start the compiled service as a child process on a free port. Then they send real `POST /v1/sign` requests over HTTP, with a random payload of 3 to 10 words. They sign with the real SoftHSM token, so they need the token, the key and the environment variables (see [Setup](#setup)). Cargo builds the service with the bench profile (optimized).
