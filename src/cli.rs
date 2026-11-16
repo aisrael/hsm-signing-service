@@ -220,6 +220,16 @@ fn do_encrypt(key_id: &str) {
     println!("{}", BASE64.encode(encrypted));
 }
 
+/// Install the log subscriber. The level comes from `RUST_LOG` (default `info`).
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_span_events(FmtSpan::CLOSE)
+        .init();
+}
+
 /// Run the HTTP signing service until the process stops.
 async fn run_server() {
     println!("hsm-signing-service version {CRATE_VERSION} starting...");
@@ -228,6 +238,9 @@ async fn run_server() {
         eprintln!("Error loading configuration: {err}");
         std::process::exit(1);
     });
+
+    // Start logging before the backend, so its start-up messages are written.
+    init_tracing();
 
     // With a session pool size, the service uses a pool of sessions. Without
     // one, it uses a single session.
@@ -263,13 +276,6 @@ where
     });
 
     let state = Arc::new(app_state);
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with_span_events(FmtSpan::CLOSE)
-        .init();
 
     let app = api::router(&config, state);
 
