@@ -175,11 +175,7 @@ There are two benchmarks. Both start the compiled service as a child process on 
 
 For the results of the load tests and the limits of these results, see [docs/benchmarks.md](docs/benchmarks.md).
 
-Load the environment variables first. If you use `direnv`, they are already set. If not, load `.envrc` in a subshell, so the variables do not stay in your shell:
-
-```sh
-(set -a; . ./.envrc; set +a; cargo bench --bench custom_benchmark)
-```
+The benchmarks also require the environment variables to be set (use `direnv`).
 
 ### `custom_benchmark`
 
