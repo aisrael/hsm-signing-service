@@ -12,6 +12,10 @@ on:
       - ".rustfmt.toml"
       - "README.md"
       - ".github/workflows/ci.yml"
+      - "scripts/build-softhsm.sh"
+      - "scripts/smoke-softhsm.sh"
+      - "scripts/softhsm.env"
+      - "Dockerfile"
 
 permissions:
   contents: read
@@ -40,30 +44,50 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Install SoftHSM
+      # SoftHSM 2.7.0 is built from source. The Ubuntu package (2.6.1) has no
+      # CKM_ECDSA_SHA256. The build is cached, and a smoke test checks it.
+      - name: Set SoftHSM variables
+        run: |
+          . scripts/softhsm.env
+          prefix="$HOME/softhsm"
+          {
+            echo "SOFTHSM_PREFIX=$prefix"
+            echo "PKCS11_MODULE=$prefix/lib/softhsm/libsofthsm2.so"
+            echo "SOFTHSM_CACHE_KEY=softhsm-${RUNNER_OS}-${RUNNER_ARCH}-${ImageOS}-${SOFTHSM_VERSION}-${{ hashFiles('scripts/softhsm.env', 'scripts/build-softhsm.sh') }}-v1"
+          } >> "$GITHUB_ENV"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+
+      - name: Restore SoftHSM cache
+        id: softhsm-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/softhsm
+          key: ${{ env.SOFTHSM_CACHE_KEY }}
+
+      - name: Build SoftHSM
+        if: steps.softhsm-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y softhsm2
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake build-essential ca-certificates curl libssl-dev libtool pkg-config
+          sh scripts/build-softhsm.sh "$SOFTHSM_PREFIX"
+
+      - name: Smoke test SoftHSM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends opensc
+          sh scripts/smoke-softhsm.sh
+
+      - name: Save SoftHSM cache
+        if: steps.softhsm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/softhsm
+          key: ${{ env.SOFTHSM_CACHE_KEY }}
 
       - name: Run tests
         env:
-          PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
           AES_KEY_LABEL: example-aes
         # CI runs the unit tests only (`--bins`). The integration tests in `tests/`
         # need a token and keys from `setup.sh`, which CI does not make yet.
-        # The skipped unit tests sign with CKM_ECDSA_SHA256. The SoftHSM in Ubuntu
-        # (2.6.1) does not support it (added in 2.7.0). Remove the skips when CI
-        # has 2.7.0.
-        run: |
-          cargo test --bins -- \
-            --skip sign_returns_a_valid_der_signature_for_an_existing_key \
-            --skip every_session_of_the_pool_can_sign \
-            --skip pool_signs_and_verifies_with_one_session \
-            --skip pool_signs_from_many_threads_at_once \
-            --skip verify_accepts_a_signature_from_sign \
-            --skip verify_fails_for_an_aes_key_label \
-            --skip verify_fails_for_an_unknown_label \
-            --skip verify_rejects_a_changed_signature \
-            --skip verify_rejects_a_signature_from_another_key \
-            --skip verify_rejects_another_payload \
-            --skip wrap_returns_the_target_key_in_a_form_the_hsm_can_unwrap
+        run: cargo test --bins
