@@ -20,9 +20,15 @@ use cryptoki::session::UserType;
 use cryptoki::slot::Slot;
 use cryptoki::types::AuthPin;
 use p256::ecdsa::Signature;
+use r2d2_cryptoki::Pool;
+use r2d2_cryptoki::PooledSession;
+use r2d2_cryptoki::SessionAuth;
+use r2d2_cryptoki::SessionManager;
+use r2d2_cryptoki::r2d2;
 use secrecy::ExposeSecret;
 
 use crate::config::Config;
+use crate::utils::der_to_raw_signature;
 
 /// Errors from the HSM backend. No message may contain the PIN.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +45,10 @@ pub enum HsmBackendError {
     OpenSession(#[source] CryptokiError),
     #[error("unable to log in to the token: {0}")]
     Login(#[source] CryptokiError),
+    #[error("unable to open the session pool: {0}")]
+    BuildPool(#[source] r2d2::Error),
+    #[error("unable to get a session from the pool: {0}")]
+    Checkout(#[source] r2d2::Error),
     #[error("unable to search for the key: {0}")]
     FindKey(#[source] CryptokiError),
     #[error("no key with the label {0:?} was found")]
@@ -263,101 +273,227 @@ fn find_public_key(session: &Session, key_id: &str) -> Result<ObjectHandle, HsmB
     exactly_one(handles, key_id)
 }
 
+/// Sign with `CKM_ECDSA_SHA256`. The HSM hashes the payload. The result is
+/// the signature in DER form (the HSM returns the raw `r || s`).
+fn sign_with(session: &Session, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
+    let key = find_private_key(session, key_id)?;
+
+    let raw = session
+        .sign(&Mechanism::EcdsaSha256, key, payload)
+        .map_err(HsmBackendError::Sign)?;
+    let signature = Signature::from_slice(&raw).map_err(HsmBackendError::InvalidSignature)?;
+    Ok(signature.to_der().as_bytes().to_vec())
+}
+
+/// Verify with `CKM_ECDSA_SHA256`. The HSM hashes the payload. `raw_signature`
+/// is the raw `r || s` form.
+fn verify_with(
+    session: &Session,
+    key_id: &str,
+    payload: &[u8],
+    raw_signature: &[u8],
+) -> Result<bool, HsmBackendError> {
+    let key = find_public_key(session, key_id)?;
+
+    match session.verify(&Mechanism::EcdsaSha256, key, payload, raw_signature) {
+        Ok(()) => Ok(true),
+        Err(CryptokiError::Pkcs11(RvError::SignatureInvalid | RvError::SignatureLenRange, _)) => {
+            Ok(false)
+        }
+        Err(e) => Err(HsmBackendError::Verify(e)),
+    }
+}
+
+/// Encrypt with `CKM_AES_GCM`. The IV comes from the HSM random number
+/// generator. The key never leaves the token.
+fn encrypt_with(
+    session: &Session,
+    key_id: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, HsmBackendError> {
+    let key = find_aes_key(session, key_id)?;
+
+    let mut iv = session
+        .generate_random_vec(GCM_IV_LEN)
+        .map_err(HsmBackendError::GenerateIv)?;
+    // The IV is not secret. Keep a copy, because the parameters borrow `iv`.
+    let iv_copy = iv.clone();
+    let params =
+        GcmParams::new(&mut iv, &[], GCM_TAG_BITS.into()).map_err(HsmBackendError::Encrypt)?;
+    let encrypted = session
+        .encrypt(&Mechanism::AesGcm(params), key, plaintext)
+        .map_err(HsmBackendError::Encrypt)?;
+
+    let mut output = iv_copy;
+    output.extend_from_slice(&encrypted);
+    Ok(output)
+}
+
+/// Split `iv || ciphertext || tag` into the IV and the rest. Do this before a
+/// session is in use, because it needs no HSM.
+fn split_encrypted(encrypted: &[u8]) -> Result<(&[u8], &[u8]), HsmBackendError> {
+    if encrypted.len() < GCM_MIN_LEN {
+        return Err(HsmBackendError::InvalidCiphertext);
+    }
+    Ok(encrypted.split_at(GCM_IV_LEN as usize))
+}
+
+/// Decrypt with `CKM_AES_GCM`. The HSM checks the tag.
+fn decrypt_with(
+    session: &Session,
+    key_id: &str,
+    iv: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, HsmBackendError> {
+    let key = find_aes_key(session, key_id)?;
+
+    let mut iv = iv.to_vec();
+    let params =
+        GcmParams::new(&mut iv, &[], GCM_TAG_BITS.into()).map_err(HsmBackendError::Decrypt)?;
+    session
+        .decrypt(&Mechanism::AesGcm(params), key, ciphertext)
+        .map_err(HsmBackendError::Decrypt)
+}
+
+/// Wrap with `CKM_AES_KEY_WRAP_PAD`. The HSM exports the target key
+/// encrypted. The plain key never leaves the token.
+fn wrap_with(
+    session: &Session,
+    key_id: &str,
+    target_key_id: &str,
+) -> Result<Vec<u8>, HsmBackendError> {
+    let wrapping_key = find_aes_key(session, key_id)?;
+    let target_key = find_private_key(session, target_key_id)?;
+
+    session
+        .wrap_key(&Mechanism::AesKeyWrapPad, wrapping_key, target_key)
+        .map_err(HsmBackendError::Wrap)
+}
+
 impl HsmBackend for CryptokiBackend {
-    /// Sign with `CKM_ECDSA_SHA256`. The HSM hashes the payload. The result is
-    /// the signature in DER form (the HSM returns the raw `r || s`).
     fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
-        let session = self.session();
-
-        let handles = find_private_keys(&session, key_id).map_err(HsmBackendError::FindKey)?;
-        let key = match handles.as_slice() {
-            [key] => *key,
-            [] => return Err(HsmBackendError::KeyNotFound(key_id.to_string())),
-            _ => return Err(HsmBackendError::AmbiguousKey(key_id.to_string())),
-        };
-
-        let raw = session
-            .sign(&Mechanism::EcdsaSha256, key, payload)
-            .map_err(HsmBackendError::Sign)?;
-        let signature = Signature::from_slice(&raw).map_err(HsmBackendError::InvalidSignature)?;
-        Ok(signature.to_der().as_bytes().to_vec())
+        sign_with(&self.session(), key_id, payload)
     }
 
-    /// Verify with `CKM_ECDSA_SHA256`. The HSM hashes the payload. It expects
-    /// the raw `r || s` form, so the DER signature is converted first.
     fn verify(
         &self,
         key_id: &str,
         payload: &[u8],
         signature: &[u8],
     ) -> Result<bool, HsmBackendError> {
-        let signature =
-            Signature::from_der(signature).map_err(HsmBackendError::InvalidSignatureEncoding)?;
-        let raw = signature.to_bytes();
-
-        let session = self.session();
-        let key = find_public_key(&session, key_id)?;
-
-        match session.verify(&Mechanism::EcdsaSha256, key, payload, &raw) {
-            Ok(()) => Ok(true),
-            Err(CryptokiError::Pkcs11(
-                RvError::SignatureInvalid | RvError::SignatureLenRange,
-                _,
-            )) => Ok(false),
-            Err(e) => Err(HsmBackendError::Verify(e)),
-        }
+        let raw_signature = der_to_raw_signature(signature)?;
+        verify_with(&self.session(), key_id, payload, &raw_signature)
     }
 
-    /// Encrypt with `CKM_AES_GCM`. The IV comes from the HSM random number
-    /// generator. The key never leaves the token.
     fn encrypt(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
-        let session = self.session();
-        let key = find_aes_key(&session, key_id)?;
-
-        let mut iv = session
-            .generate_random_vec(GCM_IV_LEN)
-            .map_err(HsmBackendError::GenerateIv)?;
-        // The IV is not secret. Keep a copy, because the parameters borrow `iv`.
-        let iv_copy = iv.clone();
-        let params =
-            GcmParams::new(&mut iv, &[], GCM_TAG_BITS.into()).map_err(HsmBackendError::Encrypt)?;
-        let encrypted = session
-            .encrypt(&Mechanism::AesGcm(params), key, plaintext)
-            .map_err(HsmBackendError::Encrypt)?;
-
-        let mut output = iv_copy;
-        output.extend_from_slice(&encrypted);
-        Ok(output)
+        encrypt_with(&self.session(), key_id, plaintext)
     }
 
-    /// Decrypt with `CKM_AES_GCM`. The HSM checks the tag.
     fn decrypt(&self, key_id: &str, encrypted: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
-        if encrypted.len() < GCM_MIN_LEN {
-            return Err(HsmBackendError::InvalidCiphertext);
-        }
-        let (iv, ciphertext) = encrypted.split_at(GCM_IV_LEN as usize);
-
-        let session = self.session();
-        let key = find_aes_key(&session, key_id)?;
-
-        let mut iv = iv.to_vec();
-        let params =
-            GcmParams::new(&mut iv, &[], GCM_TAG_BITS.into()).map_err(HsmBackendError::Decrypt)?;
-        session
-            .decrypt(&Mechanism::AesGcm(params), key, ciphertext)
-            .map_err(HsmBackendError::Decrypt)
+        let (iv, ciphertext) = split_encrypted(encrypted)?;
+        decrypt_with(&self.session(), key_id, iv, ciphertext)
     }
 
-    /// Wrap with `CKM_AES_KEY_WRAP_PAD`. The HSM exports the target key
-    /// encrypted. The plain key never leaves the token.
     fn wrap(&self, key_id: &str, target_key_id: &str) -> Result<Vec<u8>, HsmBackendError> {
-        let session = self.session();
-        let wrapping_key = find_aes_key(&session, key_id)?;
-        let target_key = find_private_key(&session, target_key_id)?;
+        wrap_with(&self.session(), key_id, target_key_id)
+    }
+}
 
-        session
-            .wrap_key(&Mechanism::AesKeyWrapPad, wrapping_key, target_key)
-            .map_err(HsmBackendError::Wrap)
+/// A connection to a SoftHSM2 token with a pool of sessions (from `r2d2`), so
+/// that several operations can run at the same time.
+///
+/// The login happens once, in `try_new`, before the pool exists. PKCS#11 login
+/// belongs to the token, so every session of the pool is logged in after that.
+/// The pool itself never logs in: a wrong PIN would make it try again and
+/// again, and every failed login counts toward the lockout of the token.
+#[derive(Debug)]
+pub struct CryptokiBackendWithSessionPool {
+    pool: Pool,
+    /// The session that logged in. It stays open for the life of the process,
+    /// so the token stays logged in even if the pool closes its sessions. It
+    /// is not used for operations. `Session` is not `Sync`, so it sits behind
+    /// a `Mutex`.
+    _login_session: Mutex<Session>,
+}
+
+impl CryptokiBackendWithSessionPool {
+    /// Load the PKCS#11 module, find the token by its label, log in as the
+    /// normal user (once), and open `pool_size` sessions. It fails at once if
+    /// the login fails or if the pool cannot open all of its sessions.
+    pub fn try_new(config: &Config, pool_size: u32) -> Result<Self, HsmBackendError> {
+        let pkcs11 = load_pkcs11(config)?;
+
+        let token_label = config.token_label();
+        let slot = find_token_by_label(pkcs11, token_label)?;
+
+        let login_session = open_logged_in_session(pkcs11, slot, config)?;
+
+        // The manager only opens sessions. The pool has no connection
+        // customizer, so it never logs in. `SessionAuth::RoUser` makes the
+        // pool open read-only sessions and expect the state "logged in".
+        // `Pkcs11` is a shared handle, and the static in `load_pkcs11` keeps
+        // the module loaded, so this clone cannot finalize the module.
+        let auth = SessionAuth::RoUser(AuthPin::new(config.hsm_pin().expose_secret().into()));
+        let manager = SessionManager::new(pkcs11.clone(), slot, &auth);
+
+        // `build` waits until all sessions are open. The pool never closes a
+        // session because of its age or because it is idle.
+        let pool = Pool::builder()
+            .max_size(pool_size)
+            .min_idle(Some(pool_size))
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connection_timeout(config.pool_connection_timeout())
+            .build(manager)
+            .map_err(HsmBackendError::BuildPool)?;
+
+        tracing::info!("connected to the HSM token {token_label:?}");
+        tracing::info!("opened {pool_size} HSM sessions");
+        Ok(CryptokiBackendWithSessionPool {
+            pool,
+            _login_session: Mutex::new(login_session),
+        })
+    }
+
+    /// Take a session from the pool. It goes back to the pool when it is
+    /// dropped. This blocks until a session is free, for at most
+    /// the pool connection timeout from the `Config`.
+    fn session(&self) -> Result<PooledSession, HsmBackendError> {
+        self.pool.get().map_err(HsmBackendError::Checkout)
+    }
+}
+
+impl HsmBackend for CryptokiBackendWithSessionPool {
+    fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
+        let session = self.session()?;
+        sign_with(&session, key_id, payload)
+    }
+
+    fn verify(
+        &self,
+        key_id: &str,
+        payload: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, HsmBackendError> {
+        let raw_signature = der_to_raw_signature(signature)?;
+        let session = self.session()?;
+        verify_with(&session, key_id, payload, &raw_signature)
+    }
+
+    fn encrypt(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
+        let session = self.session()?;
+        encrypt_with(&session, key_id, plaintext)
+    }
+
+    fn decrypt(&self, key_id: &str, encrypted: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
+        let (iv, ciphertext) = split_encrypted(encrypted)?;
+        let session = self.session()?;
+        decrypt_with(&session, key_id, iv, ciphertext)
+    }
+
+    fn wrap(&self, key_id: &str, target_key_id: &str) -> Result<Vec<u8>, HsmBackendError> {
+        let session = self.session()?;
+        wrap_with(&session, key_id, target_key_id)
     }
 }
 
@@ -368,6 +504,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::MutexGuard;
     use std::sync::OnceLock;
+    use std::time::Duration;
 
     use cryptoki::mechanism::Mechanism;
     use cryptoki::object::AttributeType;
@@ -934,6 +1071,159 @@ mod tests {
     fn sign_fails_for_a_key_that_does_not_exist() {
         let _lock = with_test_token();
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        let result = backend.sign("no-such-key", b"hello world");
+
+        assert!(
+            matches!(result, Err(HsmBackendError::KeyNotFound(ref id)) if id == "no-such-key"),
+            "unexpected: {result:?}"
+        );
+    }
+    // The backend with a session pool.
+
+    #[test]
+    fn pool_connects_to_the_token() {
+        let _lock = with_test_token();
+        let config = Config::for_test(TOKEN_LABEL, PIN);
+
+        let result = CryptokiBackendWithSessionPool::try_new(&config, 3);
+
+        let backend = result.expect("expected to connect");
+        assert_eq!(backend.pool.state().connections, 3);
+    }
+
+    #[test]
+    fn pool_fails_with_a_wrong_pin() {
+        let _lock = with_test_token();
+        let config = Config::for_test(TOKEN_LABEL, "wrong-pin");
+
+        let error =
+            CryptokiBackendWithSessionPool::try_new(&config, 3).expect_err("expected an error");
+
+        // The login happens before the pool, so the error is a login error.
+        let message = error.to_string();
+        assert!(
+            matches!(error, HsmBackendError::Login(_)),
+            "unexpected: {message}"
+        );
+        assert!(!message.contains("wrong-pin"), "the error shows the PIN");
+    }
+
+    #[test]
+    fn pool_fails_when_no_token_has_the_label() {
+        let _lock = with_test_token();
+        let config = Config::for_test("no-such-token", PIN);
+
+        let error =
+            CryptokiBackendWithSessionPool::try_new(&config, 3).expect_err("expected an error");
+
+        assert!(
+            matches!(error, HsmBackendError::TokenNotFound(_)),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn every_session_of_the_pool_can_sign() {
+        let _lock = with_test_token();
+        generate_key_pair("example-pool-sessions");
+        let backend =
+            CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 3)
+                .unwrap();
+        let payload = b"hello world";
+
+        // Hold all three sessions at the same time, so each one is used.
+        let sessions: Vec<_> = (0..3)
+            .map(|_| backend.session().expect("expected a session"))
+            .collect();
+        for session in &sessions {
+            let der = sign_with(session, "example-pool-sessions", payload)
+                .expect("a session of the pool cannot sign");
+            let signature = Signature::from_der(&der).expect("the signature is not valid DER");
+            public_key("example-pool-sessions")
+                .verify(payload, &signature)
+                .expect("the signature does not verify");
+        }
+    }
+
+    #[test]
+    fn pool_has_no_more_sessions_than_its_size() {
+        let _lock = with_test_token();
+        let backend =
+            CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 2)
+                .unwrap();
+
+        let _first = backend.session().unwrap();
+        let _second = backend.session().unwrap();
+
+        let third = backend.pool.get_timeout(Duration::from_millis(100));
+        assert!(third.is_err(), "the pool gave out a third session");
+    }
+
+    #[test]
+    fn a_session_goes_back_to_the_pool() {
+        let _lock = with_test_token();
+        let backend =
+            CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 1)
+                .unwrap();
+
+        drop(backend.session().unwrap());
+
+        let again = backend.pool.get_timeout(Duration::from_millis(100));
+        assert!(again.is_ok(), "the session did not come back");
+    }
+
+    #[test]
+    fn pool_signs_from_many_threads_at_once() {
+        let _lock = with_test_token();
+        generate_key_pair("example-pool-threads");
+        let backend =
+            CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 3)
+                .unwrap();
+        let verifying_key = public_key("example-pool-threads");
+
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let backend = &backend;
+                let verifying_key = &verifying_key;
+                scope.spawn(move || {
+                    for call in 0..5 {
+                        let payload = format!("payload {thread}-{call}");
+                        let der = backend
+                            .sign("example-pool-threads", payload.as_bytes())
+                            .expect("expected a signature");
+                        let signature =
+                            Signature::from_der(&der).expect("the signature is not valid DER");
+                        verifying_key
+                            .verify(payload.as_bytes(), &signature)
+                            .expect("the signature does not verify");
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn pool_signs_and_verifies_with_one_session() {
+        let _lock = with_test_token();
+        generate_key_pair("example-pool-one");
+        let backend =
+            CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 1)
+                .unwrap();
+
+        for _ in 0..3 {
+            let der = backend.sign("example-pool-one", b"hello world").unwrap();
+            let result = backend.verify("example-pool-one", b"hello world", &der);
+            assert!(matches!(result, Ok(true)), "unexpected: {result:?}");
+        }
+    }
+
+    #[test]
+    fn pool_sign_fails_for_a_key_that_does_not_exist() {
+        let _lock = with_test_token();
+        let backend =
+            CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 2)
+                .unwrap();
 
         let result = backend.sign("no-such-key", b"hello world");
 

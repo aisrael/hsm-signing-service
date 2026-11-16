@@ -9,11 +9,12 @@ base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["cargo", "derive"] }
 cryptoki = "0.12.1"
 p256 = "0.14.0"
+r2d2-cryptoki = "0.5.0"
 secrecy = "0.10.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
@@ -21,6 +22,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 criterion = "0.8.2"
 fake = "5.1.0"
 mockall = "0.15.0"
+tower = { version = "0.5.3", features = ["util"] }
 ureq = { version = "3.5.2", features = ["json"] }
 
 [[bench]]
