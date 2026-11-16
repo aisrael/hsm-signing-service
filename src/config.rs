@@ -29,6 +29,11 @@ pub enum ConfigError {
         "HSM_SIGNING_SERVICE_SESSION_POOL_SIZE must be a whole number of 1 or more, or not set: {0}"
     )]
     InvalidSessionPoolSize(String),
+    /// The HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS is not a whole number of 1 or more
+    #[error(
+        "HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS must be a whole number of milliseconds, 1 or more: {0}"
+    )]
+    InvalidPoolConnectionTimeout(String),
     /// The PKCS11_MODULE variable points to a file that does not exist or is not readable
     #[error("PKCS11_MODULE file not found or not readable: {0}")]
     Pkcs11ModuleNotFound(String),
@@ -45,6 +50,9 @@ pub struct Config {
     /// The number of HSM sessions in the session pool. `None` means no pool:
     /// the service uses a single session.
     session_pool_size: Option<u32>,
+    /// How long a request waits for a free session of the session pool. The
+    /// pool also uses it to open its sessions at start.
+    pool_connection_timeout: Duration,
     /// The path to the HSM PKCS#11 library
     pkcs11_module: String,
     /// The label of the token. `setup.sh` uses the same label for the key.
@@ -59,6 +67,8 @@ const DEFAULT_HSM_SIGNING_SERVICE_HOST: &str = "127.0.0.1";
 const DEFAULT_HSM_SIGNING_SERVICE_PORT: &str = "8080";
 /// The default number of seconds to wait for running requests on shutdown
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: &str = "30";
+/// The default number of milliseconds to wait for a free session of the pool
+const DEFAULT_POOL_CONNECTION_TIMEOUT_MS: &str = "500";
 /// The default path to the HSM PKCS#11 library
 const DEFAULT_PKCS11_MODULE: &str = "/opt/homebrew/opt/softhsm/lib/softhsm/libsofthsm2.so";
 
@@ -77,6 +87,16 @@ fn parse_session_pool_size(raw: String) -> Result<u32, ConfigError> {
     match raw.parse::<u32>() {
         Ok(size) if size >= 1 => Ok(size),
         _ => Err(ConfigError::InvalidSessionPoolSize(raw)),
+    }
+}
+
+/// Parse the pool connection timeout: a whole number of milliseconds, 1 or
+/// more. Zero is not valid, because a request would fail at once when all
+/// sessions are in use.
+fn parse_pool_connection_timeout(raw: String) -> Result<Duration, ConfigError> {
+    match raw.parse::<u64>() {
+        Ok(millis) if millis >= 1 => Ok(Duration::from_millis(millis)),
+        _ => Err(ConfigError::InvalidPoolConnectionTimeout(raw)),
     }
 }
 
@@ -144,6 +164,11 @@ impl Config {
             try_read_optional_from_env("HSM_SIGNING_SERVICE_SESSION_POOL_SIZE")?
                 .map(parse_session_pool_size)
                 .transpose()?;
+        let pool_connection_timeout =
+            parse_pool_connection_timeout(try_read_from_env_with_default(
+                "HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS",
+                DEFAULT_POOL_CONNECTION_TIMEOUT_MS,
+            )?)?;
         let pkcs11_module = try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)?;
 
         if !file_is_readable(&pkcs11_module) {
@@ -158,6 +183,7 @@ impl Config {
             port,
             shutdown_timeout,
             session_pool_size,
+            pool_connection_timeout,
             pkcs11_module,
             token_label,
             hsm_pin,
@@ -176,6 +202,10 @@ impl Config {
             shutdown_timeout: parse_shutdown_timeout(DEFAULT_SHUTDOWN_TIMEOUT_SECS.into())
                 .expect("the default shutdown timeout is valid"),
             session_pool_size: None,
+            pool_connection_timeout: parse_pool_connection_timeout(
+                DEFAULT_POOL_CONNECTION_TIMEOUT_MS.into(),
+            )
+            .expect("the default pool connection timeout is valid"),
             pkcs11_module: try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)
                 .expect("PKCS11_MODULE is valid"),
             token_label: token_label.into(),
@@ -196,6 +226,11 @@ impl Config {
     /// single session).
     pub fn session_pool_size(&self) -> Option<u32> {
         self.session_pool_size
+    }
+
+    /// How long a request waits for a free session of the session pool.
+    pub fn pool_connection_timeout(&self) -> Duration {
+        self.pool_connection_timeout
     }
 
     pub fn pkcs11_module(&self) -> &str {
@@ -380,6 +415,35 @@ mod tests {
     fn there_is_no_session_pool_by_default() {
         let config = Config::for_test("example", "0000");
         assert_eq!(config.session_pool_size(), None);
+    }
+
+    #[test]
+    fn pool_connection_timeout_accepts_a_whole_number_of_milliseconds() {
+        assert_eq!(
+            parse_pool_connection_timeout("500".into()).unwrap(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_pool_connection_timeout("1".into()).unwrap(),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn pool_connection_timeout_rejects_other_values() {
+        for raw in ["0", "abc", "-5", "1.5", "18446744073709551616", " 5"] {
+            let result = parse_pool_connection_timeout(raw.into());
+            assert!(
+                matches!(&result, Err(ConfigError::InvalidPoolConnectionTimeout(value)) if value == raw),
+                "{raw:?}: unexpected {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_pool_connection_timeout_is_500_milliseconds() {
+        let config = Config::for_test("example", "0000");
+        assert_eq!(config.pool_connection_timeout(), Duration::from_millis(500));
     }
 
     #[test]

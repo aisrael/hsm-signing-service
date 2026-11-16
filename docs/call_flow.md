@@ -52,7 +52,7 @@ flowchart TB
 The HSM calls are blocking, so the handler runs them with `tokio::task::spawn_blocking`. This keeps the async worker threads free. The number of HSM calls that run at the same time depends on the backend:
 
 - `CryptokiBackend` has one logged-in session behind a `Mutex`, so the HSM calls of concurrent requests run one at a time.
-- `CryptokiBackendWithSessionPool` takes a session from the pool for each call and gives it back when the call ends. Up to `HSM_SIGNING_SERVICE_SESSION_POOL_SIZE` calls run at the same time. If all sessions are in use, the call waits for a free session for up to 5 seconds. After that, it fails with a checkout error.
+- `CryptokiBackendWithSessionPool` takes a session from the pool for each call and gives it back when the call ends. Up to `HSM_SIGNING_SERVICE_SESSION_POOL_SIZE` calls run at the same time. If all sessions are in use, the call waits for a free session for up to `HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS` milliseconds (the default is 500). After that, it fails with a checkout error.
 
 The diagram shows `CryptokiBackend`. `CryptokiBackendWithSessionPool` follows the same steps. The only difference is how it gets a session (see the note after the diagram).
 

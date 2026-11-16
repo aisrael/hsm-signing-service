@@ -3,7 +3,6 @@
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use cryptoki::context::CInitializeArgs;
 use cryptoki::context::CInitializeFlags;
@@ -400,10 +399,6 @@ impl HsmBackend for CryptokiBackend {
     }
 }
 
-/// How long the pool waits to open its sessions at start, and how long a
-/// caller waits for a free session.
-const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// A connection to a SoftHSM2 token with a pool of sessions (from `r2d2`), so
 /// that several operations can run at the same time.
 ///
@@ -448,7 +443,7 @@ impl CryptokiBackendWithSessionPool {
             .min_idle(Some(pool_size))
             .idle_timeout(None)
             .max_lifetime(None)
-            .connection_timeout(POOL_CONNECTION_TIMEOUT)
+            .connection_timeout(config.pool_connection_timeout())
             .build(manager)
             .map_err(HsmBackendError::BuildPool)?;
 
@@ -462,7 +457,7 @@ impl CryptokiBackendWithSessionPool {
 
     /// Take a session from the pool. It goes back to the pool when it is
     /// dropped. This blocks until a session is free, for at most
-    /// `POOL_CONNECTION_TIMEOUT`.
+    /// the pool connection timeout from the `Config`.
     fn session(&self) -> Result<PooledSession, HsmBackendError> {
         self.pool.get().map_err(HsmBackendError::Checkout)
     }
@@ -509,6 +504,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::MutexGuard;
     use std::sync::OnceLock;
+    use std::time::Duration;
 
     use cryptoki::mechanism::Mechanism;
     use cryptoki::object::AttributeType;
