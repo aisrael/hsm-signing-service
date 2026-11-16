@@ -6,7 +6,10 @@ use std::time::Instant;
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::http::header::RETRY_AFTER;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use base64::Engine;
@@ -63,10 +66,14 @@ pub enum ApiError {
     /// Something failed inside the service. The cause is logged, not sent.
     #[error("Internal error")]
     Internal(String),
+    /// All sessions are in use and the queue is full. The client can try again.
+    #[error("Service busy, try again later")]
+    Busy,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        let mut headers = HeaderMap::new();
         let status = match &self {
             ApiError::PayloadBase64DecodingError(_) => StatusCode::BAD_REQUEST,
             ApiError::KeyNotFound => StatusCode::UNPROCESSABLE_ENTITY,
@@ -74,11 +81,15 @@ impl IntoResponse for ApiError {
                 tracing::error!("internal error: {cause}");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            ApiError::Busy => {
+                headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         };
         let error_body = ErrorResponse {
             error: self.to_string(),
         };
-        (status, Json(error_body)).into_response()
+        (status, headers, Json(error_body)).into_response()
     }
 }
 
@@ -105,6 +116,9 @@ where
 {
     trace!("POST /v1/sign");
     let start = Instant::now();
+    // The permit stays until the handler ends. When the service is full, the
+    // request fails at once and does not wait.
+    let _permit = state.try_admit().ok_or(ApiError::Busy)?;
     let decoded_payload = BASE64.decode(&request.payload)?;
 
     // `spawn_blocking` needs a `'static` closure, so it gets its own copies.
@@ -138,7 +152,7 @@ mod tests {
     use crate::hsm_backend::MockHsmBackend;
 
     fn state_with(backend: MockHsmBackend) -> State<Arc<AppState<MockHsmBackend>>> {
-        let config = Config::for_test("example", "0000");
+        let config = Config::for_test("example", "test-pin");
         let app_state = AppState::try_new(&config, backend).expect("unable to build the state");
         State(Arc::new(app_state))
     }
@@ -216,6 +230,42 @@ mod tests {
             err.into_response().status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+    }
+
+    #[tokio::test]
+    async fn handle_post_sign_rejects_the_request_when_the_service_is_full() {
+        // The mock has no expectations, so a call to the backend fails the test.
+        let state = state_with(MockHsmBackend::new());
+        let permits: Vec<_> = std::iter::from_fn(|| state.0.try_admit()).collect();
+
+        let err = handle_post_sign(state.clone(), request("example"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::Busy), "got {err:?}");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn handle_post_sign_gives_the_place_back_when_it_ends() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_sign()
+            .times(30)
+            .returning(|_, _| Ok(vec![1, 2, 3]));
+        let state = state_with(backend);
+
+        // More requests than places, one after another. Each request must free
+        // its place, or a request would get 503.
+        for _ in 0..30 {
+            let response = handle_post_sign(state.clone(), request("example"))
+                .await
+                .expect("expected a signature");
+            assert_eq!(response.0.signature, BASE64.encode([1, 2, 3]));
+        }
     }
 
     #[tokio::test]

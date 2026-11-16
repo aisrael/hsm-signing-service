@@ -39,3 +39,9 @@ export HSM_SIGNING_SERVICE_SESSION_POOL_SIZE="10"
 # this time to open its sessions at start. Use a whole number. The value 0 is
 # not valid: the server does not start. The default is 500ms.
 export HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS="500"
+
+# How many requests can wait for a free session, in addition to the requests
+# that use a session. The server answers more requests at once with 503 and a
+# Retry-After header. Use a whole number of 0 or more. With 0, no request waits.
+# The default is 20.
+export HSM_SIGNING_SERVICE_MAX_QUEUE="20"

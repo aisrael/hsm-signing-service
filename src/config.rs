@@ -34,6 +34,9 @@ pub enum ConfigError {
         "HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS must be a whole number of milliseconds, 1 or more: {0}"
     )]
     InvalidPoolConnectionTimeout(String),
+    /// The HSM_SIGNING_SERVICE_MAX_QUEUE is not a whole number of 0 or more
+    #[error("HSM_SIGNING_SERVICE_MAX_QUEUE must be a whole number of 0 or more: {0}")]
+    InvalidMaxQueue(String),
     /// The PKCS11_MODULE variable points to a file that does not exist or is not readable
     #[error("PKCS11_MODULE file not found or not readable: {0}")]
     Pkcs11ModuleNotFound(String),
@@ -53,6 +56,10 @@ pub struct Config {
     /// How long a request waits for a free session of the session pool. The
     /// pool also uses it to open its sessions at start.
     pool_connection_timeout: Duration,
+    /// How many requests can wait for a free session, in addition to the
+    /// requests that use a session. The service rejects more requests with
+    /// 503.
+    max_queue: u32,
     /// The path to the HSM PKCS#11 library
     pkcs11_module: String,
     /// The label of the token. `setup.sh` uses the same label for the key.
@@ -69,6 +76,8 @@ const DEFAULT_HSM_SIGNING_SERVICE_PORT: &str = "8080";
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: &str = "30";
 /// The default number of milliseconds to wait for a free session of the pool
 const DEFAULT_POOL_CONNECTION_TIMEOUT_MS: &str = "500";
+/// The default number of requests that can wait for a free session
+const DEFAULT_MAX_QUEUE: &str = "20";
 /// The default path to the HSM PKCS#11 library
 const DEFAULT_PKCS11_MODULE: &str = "/opt/homebrew/opt/softhsm/lib/softhsm/libsofthsm2.so";
 
@@ -98,6 +107,14 @@ fn parse_pool_connection_timeout(raw: String) -> Result<Duration, ConfigError> {
         Ok(millis) if millis >= 1 => Ok(Duration::from_millis(millis)),
         _ => Err(ConfigError::InvalidPoolConnectionTimeout(raw)),
     }
+}
+
+/// Parse the maximum queue length: a whole number of 0 or more. Zero is valid:
+/// then no request waits, and the service rejects a request when all sessions
+/// are in use.
+fn parse_max_queue(raw: String) -> Result<u32, ConfigError> {
+    raw.parse::<u32>()
+        .map_err(|_| ConfigError::InvalidMaxQueue(raw))
 }
 
 /// Check if a file exists and is readable
@@ -169,6 +186,10 @@ impl Config {
                 "HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS",
                 DEFAULT_POOL_CONNECTION_TIMEOUT_MS,
             )?)?;
+        let max_queue = parse_max_queue(try_read_from_env_with_default(
+            "HSM_SIGNING_SERVICE_MAX_QUEUE",
+            DEFAULT_MAX_QUEUE,
+        )?)?;
         let pkcs11_module = try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)?;
 
         if !file_is_readable(&pkcs11_module) {
@@ -184,6 +205,7 @@ impl Config {
             shutdown_timeout,
             session_pool_size,
             pool_connection_timeout,
+            max_queue,
             pkcs11_module,
             token_label,
             hsm_pin,
@@ -206,6 +228,8 @@ impl Config {
                 DEFAULT_POOL_CONNECTION_TIMEOUT_MS.into(),
             )
             .expect("the default pool connection timeout is valid"),
+            max_queue: parse_max_queue(DEFAULT_MAX_QUEUE.into())
+                .expect("the default maximum queue length is valid"),
             pkcs11_module: try_read_from_env_with_default("PKCS11_MODULE", DEFAULT_PKCS11_MODULE)
                 .expect("PKCS11_MODULE is valid"),
             token_label: token_label.into(),
@@ -231,6 +255,12 @@ impl Config {
     /// How long a request waits for a free session of the session pool.
     pub fn pool_connection_timeout(&self) -> Duration {
         self.pool_connection_timeout
+    }
+
+    /// How many requests can wait for a free session, in addition to the
+    /// requests that use a session.
+    pub fn max_queue(&self) -> u32 {
+        self.max_queue
     }
 
     pub fn pkcs11_module(&self) -> &str {
@@ -367,7 +397,7 @@ mod tests {
 
     #[test]
     fn default_shutdown_timeout_is_valid() {
-        let config = Config::for_test("example", "0000");
+        let config = Config::for_test("example", "test-pin");
         assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
     }
 
@@ -413,7 +443,7 @@ mod tests {
 
     #[test]
     fn there_is_no_session_pool_by_default() {
-        let config = Config::for_test("example", "0000");
+        let config = Config::for_test("example", "test-pin");
         assert_eq!(config.session_pool_size(), None);
     }
 
@@ -442,8 +472,31 @@ mod tests {
 
     #[test]
     fn default_pool_connection_timeout_is_500_milliseconds() {
-        let config = Config::for_test("example", "0000");
+        let config = Config::for_test("example", "test-pin");
         assert_eq!(config.pool_connection_timeout(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn max_queue_accepts_a_whole_number_of_0_or_more() {
+        assert_eq!(parse_max_queue("0".into()).unwrap(), 0);
+        assert_eq!(parse_max_queue("20".into()).unwrap(), 20);
+    }
+
+    #[test]
+    fn max_queue_rejects_other_values() {
+        for raw in ["abc", "-1", "1.5", "4294967296", " 5"] {
+            let result = parse_max_queue(raw.into());
+            assert!(
+                matches!(&result, Err(ConfigError::InvalidMaxQueue(value)) if value == raw),
+                "{raw:?}: unexpected {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_max_queue_is_20() {
+        let config = Config::for_test("example", "test-pin");
+        assert_eq!(config.max_queue(), 20);
     }
 
     #[test]
