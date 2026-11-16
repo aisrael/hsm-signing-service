@@ -11,6 +11,8 @@ This document shows how the parts of the service work together and how the servi
 
 In unit tests, the implementation is `MockHsmBackend`.
 
+`AppState` also limits how many requests are in the service at the same time (see "Queue limit" below).
+
 ```mermaid
 flowchart TB
     client([HTTP client])
@@ -20,7 +22,7 @@ flowchart TB
         cli["cli::run / run_server<br/>config, startup, shutdown"]
         axum["axum<br/>axum::serve + Router"]
         handler["api::handle_post_sign"]
-        state["AppState&lt;B&gt;<br/>Arc, shared by all requests"]
+        state["AppState&lt;B&gt;<br/>Arc, shared by all requests<br/>(also the queue limit)"]
         trait{{"trait HsmBackend<br/>sign, verify, encrypt, ..."}}
         cryptoki["CryptokiBackend<br/>Mutex&lt;Session&gt;<br/>(no pool size)"]
         pooled["CryptokiBackendWithSessionPool<br/>r2d2 pool of sessions<br/>(pool size set)"]
@@ -47,12 +49,21 @@ flowchart TB
     module -->|"C_Sign, C_FindObjects, ..."| softhsm
 ```
 
+## Queue limit
+
+The service has a limit for the requests that are in the handler at the same time. It is the number of sessions (`HSM_SIGNING_SERVICE_SESSION_POOL_SIZE`, or 1 without a pool) plus `HSM_SIGNING_SERVICE_MAX_QUEUE` (the default is 20). `AppState` keeps this limit as a Tokio `Semaphore`.
+
+- The handler takes a place before it does any work. It never waits for a place.
+- If no place is free, the handler returns `503` with a `Retry-After: 1` header. The request does not reach the HSM.
+- The place is free again when the handler ends, for a success and for an error.
+- With `HSM_SIGNING_SERVICE_MAX_QUEUE=0`, no request waits: the service rejects a request when all sessions are in use.
+
 ## Sign request
 
 The HSM calls are blocking, so the handler runs them with `tokio::task::spawn_blocking`. This keeps the async worker threads free. The number of HSM calls that run at the same time depends on the backend:
 
 - `CryptokiBackend` has one logged-in session behind a `Mutex`, so the HSM calls of concurrent requests run one at a time.
-- `CryptokiBackendWithSessionPool` takes a session from the pool for each call and gives it back when the call ends. Up to `HSM_SIGNING_SERVICE_SESSION_POOL_SIZE` calls run at the same time. If all sessions are in use, the call waits for a free session for up to `HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS` milliseconds (the default is 500). After that, it fails with a checkout error.
+- `CryptokiBackendWithSessionPool` takes a session from the pool for each call and gives it back when the call ends. Up to `HSM_SIGNING_SERVICE_SESSION_POOL_SIZE` calls run at the same time. If all sessions are in use, the call waits for a free session for up to `HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS` milliseconds (the default is 500). After that, it fails with a checkout error, and the handler returns `504`.
 
 The diagram shows `CryptokiBackend`. `CryptokiBackendWithSessionPool` follows the same steps. The only difference is how it gets a session (see the note after the diagram).
 
@@ -75,6 +86,10 @@ sequenceDiagram
         Axum-->>Client: 4xx rejection from the Json extractor
     end
     Axum->>Handler: handle_post_sign(State, Json(SignRequest))
+    Handler->>Handler: Take a place in the service (never waits)
+    alt no place is free (sessions + HSM_SIGNING_SERVICE_MAX_QUEUE are in use)
+        Handler-->>Client: 503 {"error": "Service busy, try again later"}<br/>Retry-After: 1
+    end
     Handler->>Handler: Decode the base64 payload
     alt the payload is not valid base64
         Handler-->>Client: 400 {"error": "Unable to base64 decode payload: ..."}
@@ -98,9 +113,13 @@ sequenceDiagram
     Cryptoki-->>Backend: raw signature
     Backend->>Backend: Convert r || s to a DER signature
     Backend-->>Pool: Ok(DER signature bytes)
-    alt the HSM fails, the key label is not unique, or (pool only) no session is free in time
+    alt the HSM fails or the key label is not unique
         Pool-->>Handler: Err(Internal)
         Handler-->>Client: 500 {"error": "Internal error"}<br/>(the cause goes to the log only)
+    end
+    alt (pool only) no session is free in time
+        Pool-->>Handler: Err(ApiError::Timeout)
+        Handler-->>Client: 504 {"error": "Request timed out"}
     end
     Pool-->>Handler: Ok(signature)
     Handler->>Handler: Encode the signature as base64<br/>and set duration_ms
@@ -121,7 +140,7 @@ sequenceDiagram
 
     Pool->>Backend: sign(key_id, payload)
     Backend->>R2d2: get()
-    alt no session is free after 5 seconds
+    alt no session is free after HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS
         R2d2-->>Backend: Err
         Backend-->>Pool: Err(Checkout)
     end
@@ -132,7 +151,7 @@ sequenceDiagram
     Backend-->>Pool: Ok(DER signature bytes)
 ```
 
-A checkout error is not a `KeyNotFound` error, so the handler returns `500 {"error": "Internal error"}`.
+`sign_blocking` maps a checkout error to `ApiError::Timeout`, so the handler returns `504 {"error": "Request timed out"}`. A client can try again later. The queue limit keeps the number of waiting requests small, so a request waits at most for the pool connection timeout.
 
 ## Startup and shutdown
 

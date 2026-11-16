@@ -69,6 +69,9 @@ pub enum ApiError {
     /// All sessions are in use and the queue is full. The client can try again.
     #[error("Service busy, try again later")]
     Busy,
+    /// No session was free before the pool connection timeout.
+    #[error("Request timed out")]
+    Timeout,
 }
 
 impl IntoResponse for ApiError {
@@ -85,6 +88,7 @@ impl IntoResponse for ApiError {
                 headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            ApiError::Timeout => StatusCode::GATEWAY_TIMEOUT,
         };
         let error_body = ErrorResponse {
             error: self.to_string(),
@@ -107,7 +111,9 @@ where
 }
 
 /// Sign the payload on a blocking thread, because the HSM backend is
-/// synchronous. Maps the backend errors to API errors.
+/// synchronous. Maps the backend errors to API errors. It fails with
+/// `ApiError::Timeout` if no session is free before the pool connection
+/// timeout.
 #[instrument(skip(state, payload))]
 async fn sign_blocking<B>(
     state: &Arc<AppState<B>>,
@@ -117,7 +123,6 @@ async fn sign_blocking<B>(
 where
     B: HsmBackend,
 {
-    // `spawn_blocking` needs a `'static` closure, so it gets its own copy.
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         state
@@ -125,6 +130,7 @@ where
             .sign(&key_id, &payload)
             .map_err(|e| match e {
                 HsmBackendError::KeyNotFound(_) => ApiError::KeyNotFound,
+                HsmBackendError::Checkout(_) => ApiError::Timeout,
                 e => ApiError::Internal(e.to_string()),
             })
     })
@@ -160,6 +166,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use r2d2_cryptoki::r2d2;
+    use r2d2_cryptoki::r2d2::ManageConnection;
+
     use super::*;
     use crate::config::Config;
     use crate::hsm_backend::MockHsmBackend;
@@ -238,6 +247,70 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ApiError::Internal(_)), "got {err:?}");
+    }
+
+    /// A connection manager that never opens a connection.
+    struct NeverConnects;
+
+    impl ManageConnection for NeverConnects {
+        type Connection = ();
+        type Error = std::io::Error;
+
+        fn connect(&self) -> Result<(), std::io::Error> {
+            Err(std::io::Error::other("no connection"))
+        }
+
+        fn is_valid(&self, _: &mut ()) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        fn has_broken(&self, _: &mut ()) -> bool {
+            false
+        }
+    }
+
+    /// The error of a pool that has no free session when the wait ends. It is
+    /// the real error that `r2d2` gives, because `r2d2::Error` has no
+    /// constructor.
+    fn checkout_error() -> r2d2::Error {
+        let pool = r2d2::Pool::builder()
+            .min_idle(Some(0))
+            .build_unchecked(NeverConnects);
+        pool.get_timeout(std::time::Duration::from_millis(10))
+            .map(|_| ())
+            .expect_err("the pool has no connection")
+    }
+
+    #[tokio::test]
+    async fn sign_blocking_fails_with_a_timeout_when_no_session_is_free() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_sign()
+            .times(1)
+            .returning(|_, _| Err(HsmBackendError::Checkout(checkout_error())));
+        let state = state_with(backend).0;
+
+        let err = sign_blocking(&state, "example".into(), vec![])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::Timeout), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn handle_post_sign_answers_504_when_no_session_is_free() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_sign()
+            .times(1)
+            .returning(|_, _| Err(HsmBackendError::Checkout(checkout_error())));
+
+        let err = handle_post_sign(state_with(backend), request("example"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "Request timed out");
+        assert_eq!(err.into_response().status(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[tokio::test]
