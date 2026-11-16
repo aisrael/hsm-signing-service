@@ -45,6 +45,9 @@ All commands read their settings from environment variables.
 | `HSM_SIGNING_SERVICE_HOST` | No | The address to listen on. The default is `127.0.0.1`. |
 | `HSM_SIGNING_SERVICE_PORT` | No | The port to listen on. The default is `8080`. |
 | `HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS` | No | How many seconds the server waits for running requests after a shutdown signal. Use a whole number of 1 or more. The default is `30`. |
+| `HSM_SIGNING_SERVICE_SESSION_POOL_SIZE` | No | How many HSM sessions the server keeps in its session pool. Use a whole number of 1 or more. If you do not set it, the server uses one session and no pool. |
+| `HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS` | No | How many milliseconds a request waits for a free session of the pool. After this time, the server answers `504`. The pool also uses this time to open its sessions at start. Use a whole number of 1 or more. The value `0` is not valid: the server does not start. The default is `500`. Only used with a session pool. |
+| `HSM_SIGNING_SERVICE_MAX_QUEUE` | No | How many requests can wait for a free session, in addition to the requests that use a session. The server answers more requests at once with `503` and a `Retry-After` header. Use a whole number of 0 or more. With `0`, no request waits. The default is `20`. |
 | `AES_KEY_LABEL` | Setup only | The label of the AES-256 key. `setup.sh` creates it. |
 | `EXPORTABLE_KEY_LABEL` | Setup only | The label of the EC P-256 key pair that `wrap` wraps. `setup.sh` creates it. |
 
@@ -82,6 +85,8 @@ Error responses have the body `{"error": "..."}`:
 | 400 | The `payload` field is not valid base64. |
 | 422 | The token has no private key with the label `key_id`. |
 | 500 | An internal error. The response does not show the cause. The service writes it to the log. |
+| 503 | The queue limit is reached: all sessions are in use and `HSM_SIGNING_SERVICE_MAX_QUEUE` requests are already waiting. The response has a `Retry-After: 1` header. The request did not reach the HSM, so the client can try again. |
+| 504 | No session was free after `HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS` milliseconds. Only happens with a session pool. |
 
 The server stops when it gets SIGINT (Ctrl+C) or SIGTERM (the signal that Docker and Kubernetes send). It stops accepting new connections and waits for the requests that are running. Then it exits with code 0. If requests are still running after `HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS` seconds, the server logs a warning and exits with code 1.
 

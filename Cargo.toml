@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 criterion = "0.8.2"
 fake = "5.1.0"
 mockall = "0.15.0"
+tower = { version = "0.5.3", features = ["util"] }
 ureq = { version = "3.5.2", features = ["json"] }
 
 [[bench]]

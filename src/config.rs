@@ -237,6 +237,14 @@ impl Config {
         }
     }
 
+    /// The same `Config`, with another queue length. For tests that need a
+    /// small limit for the requests.
+    #[cfg(test)]
+    pub fn with_max_queue(mut self, max_queue: u32) -> Self {
+        self.max_queue = max_queue;
+        self
+    }
+
     pub fn addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
@@ -257,10 +265,12 @@ impl Config {
         self.pool_connection_timeout
     }
 
-    /// How many requests can wait for a free session, in addition to the
-    /// requests that use a session.
-    pub fn max_queue(&self) -> u32 {
-        self.max_queue
+    /// How many requests can be in the service at the same time: the sessions
+    /// (one without a pool) plus the queue. The service answers more requests
+    /// with 503.
+    pub fn max_concurrent_requests(&self) -> usize {
+        let sessions = self.session_pool_size.unwrap_or(1) as usize;
+        sessions + self.max_queue as usize
     }
 
     pub fn pkcs11_module(&self) -> &str {
@@ -494,9 +504,26 @@ mod tests {
     }
 
     #[test]
-    fn default_max_queue_is_20() {
+    fn without_a_pool_the_service_takes_one_session_plus_the_queue() {
         let config = Config::for_test("example", "test-pin");
-        assert_eq!(config.max_queue(), 20);
+        // 1 session + 20 in the queue
+        assert_eq!(config.max_concurrent_requests(), 21);
+    }
+
+    #[test]
+    fn with_a_pool_the_service_takes_the_pool_size_plus_the_queue() {
+        let mut config = Config::for_test("example", "test-pin");
+        config.session_pool_size = Some(10);
+        config.max_queue = 5;
+        assert_eq!(config.max_concurrent_requests(), 15);
+    }
+
+    #[test]
+    fn with_no_queue_the_service_takes_only_the_sessions() {
+        let mut config = Config::for_test("example", "test-pin");
+        config.session_pool_size = Some(4);
+        config.max_queue = 0;
+        assert_eq!(config.max_concurrent_requests(), 4);
     }
 
     #[test]

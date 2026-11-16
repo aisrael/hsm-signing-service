@@ -11,7 +11,7 @@ This document shows how the parts of the service work together and how the servi
 
 In unit tests, the implementation is `MockHsmBackend`.
 
-`AppState` also limits how many requests are in the service at the same time (see "Queue limit" below).
+The router has a middleware that limits how many requests are in the service at the same time (see "Queue limit" below).
 
 ```mermaid
 flowchart TB
@@ -22,7 +22,7 @@ flowchart TB
         cli["cli::run / run_server<br/>config, startup, shutdown"]
         axum["axum<br/>axum::serve + Router"]
         handler["api::handle_post_sign"]
-        state["AppState&lt;B&gt;<br/>Arc, shared by all requests<br/>(also the queue limit)"]
+        state["AppState&lt;B&gt;<br/>Arc, shared by all requests"]
         trait{{"trait HsmBackend<br/>sign, verify, encrypt, ..."}}
         cryptoki["CryptokiBackend<br/>Mutex&lt;Session&gt;<br/>(no pool size)"]
         pooled["CryptokiBackendWithSessionPool<br/>r2d2 pool of sessions<br/>(pool size set)"]
@@ -51,11 +51,12 @@ flowchart TB
 
 ## Queue limit
 
-The service has a limit for the requests that are in the handler at the same time. It is the number of sessions (`HSM_SIGNING_SERVICE_SESSION_POOL_SIZE`, or 1 without a pool) plus `HSM_SIGNING_SERVICE_MAX_QUEUE` (the default is 20). `AppState` keeps this limit as a Tokio `Semaphore`.
+The service has a limit for the requests that are in the handler at the same time. It is the number of sessions (`HSM_SIGNING_SERVICE_SESSION_POOL_SIZE`, or 1 without a pool) plus `HSM_SIGNING_SERVICE_MAX_QUEUE` (the default is 20). `api::router` applies the limit with the `api::limit_requests` middleware. It keeps a Tokio `Semaphore` and takes one place with `try_acquire` for each request, so it never waits.
 
-- The handler takes a place before it does any work. It never waits for a place.
-- If no place is free, the handler returns `503` with a `Retry-After: 1` header. The request does not reach the HSM.
-- The place is free again when the handler ends, for a success and for an error.
+- The middleware runs before the handler. A request over the limit is rejected before the service reads its JSON body.
+- The middleware is also the place for other checks that must run before the handler.
+- If no place is free, the service returns `503` with a `Retry-After: 1` header. The request does not reach the HSM.
+- The place is free again when the response is ready, for a success and for an error.
 - With `HSM_SIGNING_SERVICE_MAX_QUEUE=0`, no request waits: the service rejects a request when all sessions are in use.
 
 ## Sign request
@@ -81,15 +82,15 @@ sequenceDiagram
     participant HSM as SoftHSM2 token
 
     Client->>Axum: POST /v1/sign<br/>{key_id, algorithm, payload (base64)}
-    Axum->>Axum: Route to the handler and parse the JSON body<br/>into SignRequest
+    Axum->>Axum: Route the request and take a place in the service<br/>(limit_requests middleware, never waits)
+    alt no place is free (sessions + HSM_SIGNING_SERVICE_MAX_QUEUE are in use)
+        Axum-->>Client: 503 {"error": "Service busy, try again later"}<br/>Retry-After: 1
+    end
+    Axum->>Axum: Parse the JSON body into SignRequest
     alt the body is not valid JSON, or has an unknown field or algorithm
         Axum-->>Client: 4xx rejection from the Json extractor
     end
     Axum->>Handler: handle_post_sign(State, Json(SignRequest))
-    Handler->>Handler: Take a place in the service (never waits)
-    alt no place is free (sessions + HSM_SIGNING_SERVICE_MAX_QUEUE are in use)
-        Handler-->>Client: 503 {"error": "Service busy, try again later"}<br/>Retry-After: 1
-    end
     Handler->>Handler: Decode the base64 payload
     alt the payload is not valid base64
         Handler-->>Client: 400 {"error": "Unable to base64 decode payload: ..."}

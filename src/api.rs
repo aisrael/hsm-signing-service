@@ -5,21 +5,27 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::Request;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::http::header::RETRY_AFTER;
+use axum::middleware;
+use axum::middleware::Next;
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::post;
 use base64::Engine;
 use base64::engine::GeneralPurpose;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use tracing::instrument;
 use tracing::trace;
 
 use crate::app_state::AppState;
+use crate::config::Config;
 use crate::hsm_backend::HsmBackend;
 use crate::hsm_backend::HsmBackendError;
 
@@ -66,7 +72,9 @@ pub enum ApiError {
     /// Something failed inside the service. The cause is logged, not sent.
     #[error("Internal error")]
     Internal(String),
-    /// All sessions are in use and the queue is full. The client can try again.
+    /// The service has too many requests: all sessions are in use and the queue
+    /// is full. The client can try again. The `limit_requests` middleware gives this
+    /// error.
     #[error("Service busy, try again later")]
     Busy,
     /// No session was free before the pool connection timeout.
@@ -100,13 +108,35 @@ impl IntoResponse for ApiError {
 /// Just an alias for the base64 engine we use to decode the payload.
 pub(crate) const BASE64: GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// Middleware that limits how many requests are in the service. It takes one
+/// place of the semaphore for each request and gives it back when the response
+/// is ready. A request over the limit does not wait: it gets `503` at once,
+/// before the service reads its body.
+///
+/// This is the place for other checks that must run before the handler.
+async fn limit_requests(
+    State(places): State<Arc<Semaphore>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(_place) = places.try_acquire() else {
+        return ApiError::Busy.into_response();
+    };
+    next.run(request).await
+}
+
 /// Build the router with all the routes of the API.
-pub fn router<B>(state: Arc<AppState<B>>) -> Router
+///
+/// At most `config.max_concurrent_requests()` requests are in the service at
+/// the same time (see `limit_requests`).
+pub fn router<B>(config: &Config, state: Arc<AppState<B>>) -> Router
 where
     B: HsmBackend,
 {
+    let places = Arc::new(Semaphore::new(config.max_concurrent_requests()));
     Router::new()
         .route("/v1/sign", post(handle_post_sign))
+        .layer(middleware::from_fn_with_state(places, limit_requests))
         .with_state(state)
 }
 
@@ -148,9 +178,6 @@ where
 {
     trace!("POST /v1/sign");
     let start = Instant::now();
-    // The permit stays until the handler ends. When the service is full, the
-    // request fails at once and does not wait.
-    let _permit = state.try_admit().ok_or(ApiError::Busy)?;
     let decoded_payload = BASE64.decode(&request.payload)?;
 
     let signature = sign_blocking(&state, request.key_id.clone(), decoded_payload).await?;
@@ -166,11 +193,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
     use r2d2_cryptoki::r2d2;
     use r2d2_cryptoki::r2d2::ManageConnection;
+    use tower::ServiceExt;
 
     use super::*;
-    use crate::config::Config;
     use crate::hsm_backend::MockHsmBackend;
 
     fn state_with(backend: MockHsmBackend) -> State<Arc<AppState<MockHsmBackend>>> {
@@ -388,39 +417,90 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn handle_post_sign_rejects_the_request_when_the_service_is_full() {
-        // The mock has no expectations, so a call to the backend fails the test.
-        let state = state_with(MockHsmBackend::new());
-        let permits: Vec<_> = std::iter::from_fn(|| state.0.try_admit()).collect();
+    /// A router that has one place: no session pool and no queue.
+    fn router_with_one_place(backend: MockHsmBackend) -> Router {
+        let config = Config::for_test("example", "test-pin").with_max_queue(0);
+        assert_eq!(config.max_concurrent_requests(), 1);
+        router(&config, state_with(backend).0)
+    }
 
-        let err = handle_post_sign(state.clone(), request("example"))
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, ApiError::Busy), "got {err:?}");
-        let response = err.into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
-        drop(permits);
+    /// A `POST /v1/sign` request for the router, as HTTP.
+    fn http_request() -> Request<Body> {
+        Request::post("/v1/sign")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_id":"example","algorithm":"ECDSA_P256_SHA256","payload":"aGVsbG8="}"#,
+            ))
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn handle_post_sign_gives_the_place_back_when_it_ends() {
+    async fn router_answers_503_when_the_limit_is_reached() {
+        // The first request stays in the backend until the test lets it go.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let mut backend = MockHsmBackend::new();
+        // Only the first request reaches the backend. A second call fails the
+        // test.
+        backend.expect_sign().times(1).returning(move |_, _| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(vec![1])
+        });
+        let app = router_with_one_place(backend);
+
+        let first = tokio::spawn(app.clone().oneshot(http_request()));
+        tokio::task::spawn_blocking(move || started_rx.recv())
+            .await
+            .unwrap()
+            .expect("the first request must reach the backend");
+
+        let second = app.clone().oneshot(http_request()).await.unwrap();
+
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(second.headers().get(RETRY_AFTER).unwrap(), "1");
+        let body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            br#"{"error":"Service busy, try again later"}"#
+        );
+
+        release_tx.send(()).unwrap();
+        let first = first.await.unwrap().unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_gives_the_place_back_when_a_request_ends() {
         let mut backend = MockHsmBackend::new();
         backend
             .expect_sign()
             .times(30)
             .returning(|_, _| Ok(vec![1, 2, 3]));
-        let state = state_with(backend);
+        // Only one place. More requests than places, one after another. Each
+        // request must free its place, or a request would get 503.
+        let app = router_with_one_place(backend);
 
-        // More requests than places, one after another. Each request must free
-        // its place, or a request would get 503.
         for _ in 0..30 {
-            let response = handle_post_sign(state.clone(), request("example"))
-                .await
-                .expect("expected a signature");
-            assert_eq!(response.0.signature, BASE64.encode([1, 2, 3]));
+            let response = app.clone().oneshot(http_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn router_gives_the_place_back_when_a_request_fails() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_sign()
+            .times(5)
+            .returning(|key_id, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
+        let app = router_with_one_place(backend);
+
+        for _ in 0..5 {
+            let response = app.clone().oneshot(http_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         }
     }
 

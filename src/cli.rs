@@ -271,7 +271,7 @@ where
         .with_span_events(FmtSpan::CLOSE)
         .init();
 
-    let app = api::router(state);
+    let app = api::router(&config, state);
 
     let addr = config.addr();
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
