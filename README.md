@@ -3,6 +3,44 @@ hsm-signing-service
 
 An exercise demonstrating how to interface with an HSM service (SoftHSM) and serve signing requests over an API, written in Rust.
 
+## Introduction
+
+This project is a REST service that signs data with a key that stays inside a hardware security module (HSM). A client sends `POST /v1/sign` with a key label and a payload. The HSM signs the payload with the requested algorithm, and the service returns the signature.
+
+### Architecture
+
+A request goes through three layers:
+
+```mermaid
+flowchart LR
+    client([Client]) --> axum["axum handler<br/>and middleware"]
+    axum --> backend["HsmBackend"]
+    backend --> softhsm[("SoftHSM")]
+```
+
+- **axum and middleware:** They own the HTTP endpoints. A middleware does the admission control. An HSM session is a scarce resource, so when too many requests are running or waiting, the middleware rejects new requests at once with `503`. The handlers do not talk to the HSM directly. They use the `HsmBackend` trait.
+- **`HsmBackend`:** This trait is the only way to reach the HSM. It has two implementations. One uses a single session. The other uses a pool of sessions, and it is used when you configure a pool size. A request that waits too long for a session gets `504`. The handler tests use a mock backend, so they need no HSM.
+- **SoftHSM:** It holds the token and the keys. It does the signing, so the private key never leaves it. A real HSM can replace it, because both use the PKCS#11 interface.
+
+For the component diagram and the sequence diagrams, see [docs/call_flow.md](docs/call_flow.md). For the decision about the limits, see [docs/adrs/001-implemented-max-concurrent-requests.md](docs/adrs/001-implemented-max-concurrent-requests.md). For the load tests, see [Benchmarks](#benchmarks). To run the service in a container, see [Container image](#container-image).
+
+### Concurrency and admission control
+
+An HSM session is a scarce resource, and an HSM call is slow compared to the rest of a request. Two features control how the service uses sessions:
+
+- **Session pool:** Without a pool, the service uses one session, so signing requests are done one at a time. With a pool several requests can be signed at the same time. A bigger pool can raise throughput only if the HSM can do the work in parallel. SoftHSM may not, so measure before you choose a size (see [Benchmarks](#benchmarks)). If all sessions are in use, a request waits for a free one for a short time. After that, it gets `504`.
+- **Admission control:** The service accepts only a fixed number of requests at the same time. The limit is the number of sessions plus the queue size. A request over the limit gets `503` with a `Retry-After` header at once, and it never reaches the HSM. With a queue size of `0`, no request waits.
+
+The effect is that the service does not slow down for everyone when the load is too high. Accepted requests wait only a short, bounded time. The excess load is rejected early and cheaply, and the client can try again.
+
+For the details of the decision, see [docs/adrs/001-implemented-max-concurrent-requests.md](docs/adrs/001-implemented-max-concurrent-requests.md).
+
+### Security Approaches
+
+- **Key management:** The HSM makes and keeps every key. `setup.sh` generates the keys inside the token, and we never import a key. The signing key and the AES key are not extractable, so a key never leaves the HSM in plain form. The only export is a demo key that `wrap` outputs encrypted under the AES key. The service finds a key by its label. It has no key rotation, backup or per-key access control (see [Known limitations](#known-limitations)).
+- **Secrets:** The service reads the PIN from an environment variable. The code does not log it, and the repository does not hold it.
+- **Access:** The endpoint has no authentication. Anyone who can reach it can sign with the keys in the token. The service listens on `127.0.0.1` by default. Keep it on a trusted network.
+
 ## Setup
 
 Required tools:
@@ -37,6 +75,27 @@ cargo run -- --help
 
 All commands read their settings from environment variables.
 
+| Command | What it does |
+| --- | --- |
+| `server` | Starts the HTTP service. It has the endpoint `POST /v1/sign`. |
+| `encrypt` | Encrypts data from STDIN with an AES-256-GCM key inside the HSM. |
+| `decrypt` | Decrypts the output of `encrypt` inside the HSM. |
+| `verify` | Checks an ECDSA signature inside the HSM. |
+| `wrap` | Encrypts an EC private key with an AES key inside the HSM. |
+
+For the arguments, the output, the error responses and the exit codes of each command, see [docs/commands.md](docs/commands.md).
+
+```sh
+cargo run -- server
+curl -X POST http://127.0.0.1:8080/v1/sign \
+  -H 'Content-Type: application/json' \
+  -d '{"key_id": "example", "algorithm": "ECDSA_P256_SHA256", "payload": "aGVsbG8gd29ybGQ="}'
+```
+
+**Warning:** The endpoint has no authentication. Anyone who can reach it can sign data with the keys in the token. Keep the default address (`127.0.0.1`) unless you add access control.
+
+### Environment variables reference
+
 | Variable | Required | Description |
 | --- | --- | --- |
 | `HSM_TOKEN_LABEL` | Yes | The label of the SoftHSM token. |
@@ -51,139 +110,9 @@ All commands read their settings from environment variables.
 | `AES_KEY_LABEL` | Setup only | The label of the AES-256 key. `setup.sh` creates it. |
 | `EXPORTABLE_KEY_LABEL` | Setup only | The label of the EC P-256 key pair that `wrap` wraps. `setup.sh` creates it. |
 
-### `server`
-
-Starts the HTTP service.
-
-```sh
-cargo run -- server
-```
-
-The service has one API endpoint: `POST /v1/sign`. The `key_id` field is the label of an EC P-256 private key in the token. The HSM hashes the payload with SHA-256 and signs it with ECDSA. The private key never leaves the HSM.
-
-```sh
-curl -X POST http://127.0.0.1:8080/v1/sign \
-  -H 'Content-Type: application/json' \
-  -d '{"key_id": "example", "algorithm": "ECDSA_P256_SHA256", "payload": "aGVsbG8gd29ybGQ="}'
-```
-
-The response has the signature as base64 of a DER-encoded ECDSA signature:
-
-```json
-{
-  "key_id": "example",
-  "algorithm": "ECDSA_P256_SHA256",
-  "signature": "MEUCIQ...",
-  "duration_ms": 8
-}
-```
-
-Error responses have the body `{"error": "..."}`:
-
-| Status | Cause |
-| --- | --- |
-| 400 | The `payload` field is not valid base64. |
-| 422 | The token has no private key with the label `key_id`. |
-| 500 | An internal error. The response does not show the cause. The service writes it to the log. |
-| 503 | The queue limit is reached: all sessions are in use and `HSM_SIGNING_SERVICE_MAX_QUEUE` requests are already waiting. The response has a `Retry-After: 1` header. The request did not reach the HSM, so the client can try again. |
-| 504 | No session was free after `HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS` milliseconds. Only happens with a session pool. |
-
-The server stops when it gets SIGINT (Ctrl+C) or SIGTERM (the signal that Docker and Kubernetes send). It stops accepting new connections and waits for the requests that are running. Then it exits with code 0. If requests are still running after `HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS` seconds, the server logs a warning and exits with code 1.
-
-**Warning:** The endpoint has no authentication. Anyone who can reach it can sign data with the keys in the token. Keep the default address (`127.0.0.1`) unless you add access control.
-
-### `encrypt`
-
-Encrypts data with AES-256-GCM inside the HSM. The command reads the plaintext from STDIN and prints the result to STDOUT as base64.
-
-The `--key-id` argument is required. It is the label of an AES key in the token.
-
-```sh
-printf 'hello world' | cargo run -- encrypt --key-id example-aes
-```
-
-The command encrypts the input exactly as it is. `echo` adds a newline at the end, so use `printf` or `echo -n` if you do not want the newline.
-
-The output is base64 of `iv || ciphertext || tag`:
-
-- `iv`: 12 bytes. The HSM makes a new random IV for each call. You cannot set it.
-- `ciphertext`: the same length as the plaintext.
-- `tag`: 16 bytes. It authenticates the data.
-
-If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.
-
-### `decrypt`
-
-Decrypts the output of `encrypt` inside the HSM. The command reads the base64 text from STDIN and writes the plaintext to STDOUT.
-
-The `--key-id` argument is required. It must be the label of the AES key that `encrypt` used.
-
-```sh
-printf 'hello world' | cargo run -- encrypt --key-id example-aes | cargo run -- decrypt --key-id example-aes
-```
-
-The command ignores spaces and newlines around the input. It writes the plaintext bytes exactly as they were. It does not add a newline.
-
-AES-GCM checks the tag. The command fails if you use the wrong key or if someone changed the data. It also fails if the input is not valid base64 or is shorter than 28 bytes (the IV and the tag).
-
-If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.
-
-### `verify`
-
-Checks an ECDSA signature inside the HSM (`CKM_ECDSA_SHA256`). The command reads the payload from STDIN and uses the EC public key of the key pair.
-
-The following arguments are required:
-
-- `--key-id`: the label of the EC key pair that made the signature. The public key must have the same label as the private key.
-- `--signature`: the signature as base64 of the DER form. This is the `signature` field of the API response.
-
-```sh
-printf 'hello world' | cargo run -- verify --key-id example --signature MEUCIQ...
-```
-
-This example signs through the API and then verifies the result (it needs `jq`):
-
-```sh
-printf 'hello world' > payload.txt
-signature=$(curl -s -X POST http://127.0.0.1:8080/v1/sign \
-  -H 'Content-Type: application/json' \
-  -d "{\"key_id\": \"example\", \"algorithm\": \"ECDSA_P256_SHA256\", \"payload\": \"$(base64 < payload.txt)\"}" \
-  | jq -r .signature)
-cargo run -- verify --key-id example --signature "$signature" < payload.txt
-```
-
-The API takes the payload as base64, but `verify` takes the raw bytes on STDIN. The command uses the input exactly as it is, so a newline at the end changes the result. Use `printf` or `echo -n`.
-
-| Exit code | Meaning |
-| --- | --- |
-| 0 | The signature matches. The command prints `valid` to STDOUT. |
-| 1 | The signature does not match, or an error happened (for example, the key does not exist or the signature is not valid base64 or DER). The command prints a message to STDERR. STDOUT stays empty. |
-| 2 | An argument is missing or wrong. |
-
-### `wrap`
-
-Encrypts an EC private key with an AES key inside the HSM (AES key wrap with padding, `CKM_AES_KEY_WRAP_PAD`). The command prints the encrypted key to STDOUT as base64.
-
-The following arguments are required:
-
-- `--key-id`: the label of the AES key that wraps. `setup.sh` creates the key `example-aes`.
-- `--target-key-id`: the label of the EC private key to wrap. `setup.sh` creates the key `example-exportable` for this purpose.
-
-```sh
-cargo run -- wrap --key-id example-aes --target-key-id example-exportable
-```
-
-The output is the private key (PKCS#8) encrypted under the AES key. It is safe to store, because only an HSM that has the same AES key can decrypt it. The AES key and the plain private key never leave the HSM. The command gives the same output each time, because AES key wrap uses no IV.
-
-The HSM wraps only a key that is extractable. `setup.sh` makes only `example-exportable` extractable (and sensitive), and it fails if any other key in the token is extractable. The signing key stays non-extractable, so `wrap` fails for it. This is on purpose. `example-exportable` exists to demonstrate the command.
-
-`wrap` supports EC private keys only. The program has no `unwrap` command.
-
-If the command fails, it prints an error to STDERR and exits with code 1. STDOUT stays empty.
-
 ## Container image
 
-The `Dockerfile` builds the service with SoftHSM 2.7.0 (built from source, because the Debian package is 2.6.1 and cannot sign with `CKM_ECDSA_SHA256`). The commands work with `docker` and with `podman`.
+The `Dockerfile` builds the service with SoftHSM 2.7.0 (built from source, because the Debian package is too old, see the SoftHSM version in [Setup](#setup)). The commands work with `docker` and with `podman`.
 
 The image has two targets:
 
@@ -218,7 +147,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -v example-hsm-tokens:/var/lib/softhsm/to
   example-hsm-signing-service
 ```
 
-Then send the request from the [`server`](#server) section to `http://127.0.0.1:8080/v1/sign`. You can set the other variables of the table above with more `-e` options. The `docker stop` command sends SIGTERM, and the service shuts down gracefully.
+Then send the request from the [`server`](docs/commands.md#server) section to `http://127.0.0.1:8080/v1/sign`. You can set the other variables of the table above with more `-e` options. The `docker stop` command sends SIGTERM, and the service shuts down gracefully.
 
 Notes:
 
@@ -270,3 +199,132 @@ cargo bench --bench criterion_benchmark -- --baseline before
 ```
 
 `criterion` prints the time for each run and tells you if the time changed. It saves the results and an HTML report in `target/criterion`.
+
+## Assumptions
+
+- **Prototype:** The project is a development prototype. It needs a recent SoftHSM (see [Setup](#setup)). A real HSM is assumed to support the mechanism `CKM_ECDSA_SHA256` and to work through `PKCS11_MODULE`.
+- **Keys:** `key_id` is the label of an EC P-256 private key. Labels are unique. The public key has the same label as the private key, so `verify` can find it.
+- **Signing:** `payload` is the message, and the HSM hashes it with SHA-256. Signatures are DER-encoded.
+- **Network:** The service _MUST_ run on a trusted network.
+- **Instances:** With SoftHSM, run one service instance for each token volume. A real HSM may serve many instances.
+- **Benchmarks:** The load client and the service run on one machine.
+- **Scale:** The load is low and steady. A prototype does not need to scale, so the service runs as a fixed number of instances.
+
+## Known limitations
+
+### Security
+
+- The endpoint has no authentication, authorization, TLS or rate limit for each client. Anyone who can reach it can sign with the keys in the token.
+- Any EC private key in the token can be used through the API. There is no list of allowed keys.
+- `setup.sh` gives the PIN to `pkcs11-tool` on the command line. Other local users can see it in the process list.
+- The demo key `example-exportable` is extractable. It is sensitive, and `wrap` outputs it only in encrypted form.
+- There is no key rotation, revocation or backup. The token is the only copy of the keys.
+
+### Behavior
+
+- The service uses only one token, which it finds by its label, and one user PIN.
+- The service does not validate `key_id`. An unknown key gives `422`.
+- Bad JSON, an unknown algorithm or a wrong content type gets a plain-text error from axum, and not a JSON `{"error": ...}` body.
+- The service does not replace a session that the HSM closes. Restart the service to fix this.
+- `GET /healthz` shows only that the process answers HTTP. It does not call the HSM. There is no readiness endpoint.
+- The `504` timeout covers only the wait for a free session. A started HSM call cannot be cancelled.
+- On SIGTERM, running requests finish. If they take longer than `HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS`, the process exits with code 1. No test covers a request that is running during shutdown.
+- The service never finalizes the PKCS#11 module, because SoftHSM crashes if it does.
+
+### Performance and testing
+
+- SoftHSM may do signing one call at a time inside the library, so a bigger session pool may not raise throughput. We have not proven where the bottleneck is.
+- The service cannot scale itself. It has no metrics endpoint, so an autoscaler has no signal to use. With SoftHSM, you also cannot add instances, because one token volume serves one instance.
+- The recorded benchmark ran on a busy machine, from a commit with uncommitted changes. It does not count `503` and `504` errors separately.
+- CI runs only the unit tests and skips the tests that need a token. It does not build the container image.
+
+## Production considerations
+
+This project is a prototype. Before you use the design in production, think about the following points.
+
+### HSM
+
+- **Real HSM:** Replace SoftHSM with a network HSM or a cloud HSM. Set `PKCS11_MODULE` to the library of the vendor. Check that the HSM supports `CKM_ECDSA_SHA256`, and check its limits for clients and sessions.
+- **Many instances:** With SoftHSM, run one service instance for each token volume. We assume a network HSM can serve many instances, but we did not test it. The HSM then limits the total throughput, so measure with the real device before you choose the number of instances and the pool size.
+- **High availability:** One HSM is a single point of failure. Use a cluster of HSMs with the same keys, or a [federated architecture](#federated-signing-design), and plan how the service reconnects when an HSM or a session fails. The service does not replace a closed session today, so a restart is needed.
+- **Reconnect:** The service should recover when an HSM or a session fails, and not need a restart. When a call fails because the session or the token is gone, the service opens a new session, logs in again if needed, and tries the call again. It should try a limited number of times, with a longer wait after each failure, and it stops when the request runs out of time. The service should not try again after a wrong PIN, because failed logins count toward the lockout of the token. If the HSM does not come back in time, the client gets a clear error that it can try again later. The service also reports that it is unavailable through a readiness check, so Kubernetes stops sending traffic to that instance until the HSM is back. The liveness check stays healthy, so Kubernetes does not restart the instance while it reconnects.
+- **Keys:** Add a key ceremony with dual control, key backup, rotation and revocation. Today the token is the only copy of the keys. Use a key policy that limits which keys the API can use (see Access).
+
+### Secrets
+
+- **PIN:** Give `HSM_PIN` to the container from a secret store, such as a Kubernetes `Secret`. Do not keep it in a file in the repository.
+- **Provisioning:** `setup.sh` gives the PIN to `pkcs11-tool` on the command line, so other users on the same machine can see it for a short time. In production, do the provisioning from a trusted, single-user host or container, or replace the script with a Rust `setup` command that reads the PIN from the environment and never puts it in an argument. Do not run the `setup` image in production.
+- **Demo key:** Remove `example-exportable` and the `wrap` demo. No key in production should be extractable.
+
+### Access
+
+- **Authentication and authorization:** The endpoint has none today. Add authentication, such as mutual TLS or tokens, and decide which client may use which key. Put the service behind a gateway or a service mesh, and keep the port on a trusted network.
+- **TLS:** The service speaks plain HTTP. End TLS at a proxy, or in the service.
+- **Limits for each client:** The admission control limits the total load. Add a limit for each client, so one client cannot use all the places.
+- **Audit:** Record who signed what, with which key, and when. Do not log the payload or any secret.
+
+### Operations
+
+- **Health:** `GET /healthz` is a liveness check only. Add a readiness check, for example one that returns `503` when the service rejects requests, and a check that calls the HSM.
+- **Shutdown:** Set `HSM_SIGNING_SERVICE_SHUTDOWN_TIMEOUT_SECS` lower than the grace period of the orchestrator, so the service exits with a clear code before it is killed. Test a shutdown with a request in flight.
+- **Observability:** Add metrics for the number of sessions in use, the queue length, the `503` and `504` counts, and the signing latency. Add tracing across services.
+- **Auto-scaling:** Make the service scale with the traffic. Emit metrics in the Prometheus format (a `/metrics` endpoint) that an autoscaler can use, for example a KEDA `ScaledObject` in Kubernetes. Good signals are the number of requests in the service, the queue length, the rate of `503` answers, and the signing latency. Set a minimum number of instances for availability, and a maximum number that the HSM can serve: the number of instances times the pool size must stay under the session limit of the HSM. Scale up fast and scale down slowly, because a new instance must connect to the HSM and log in before it can serve requests, and a readiness check must tell the autoscaler when it is ready.
+- **Tuning:** Set the pool size, the queue size and the pool timeout from a benchmark on the real HSM, from a clean build on a quiet machine. Count `503` and `504` separately.
+- **CI:** Run the integration tests and build the container image in CI.
+- **Algorithms:** Today the service supports one algorithm. More algorithms need new checks of the key type, the mechanism and the signature format.
+
+### Federated signing design
+
+This is a sketch of a design that shows how to grow from one HSM to many without a copy of a key on more than one HSM.
+
+**Key hierarchy**
+
+- **Root key:** One root key signs the certificates of the intermediate keys, and nothing else. It lives in its own HSM, which is offline and used only in a key ceremony. The service never sees it.
+- **Intermediate signing keys:** Each intermediate key is generated inside one HSM and is not extractable. The HSM makes a certificate request. Operators sign it with the root key in a key ceremony, which gives an intermediate certificate. We make many intermediate keys and spread them over many HSMs. A key exists in one HSM, so we move no key between HSMs.
+- **Verification:** A client checks a signature with the public key of the intermediate certificate, and checks the certificate against the root. Clients trust only the root. We can add, rotate or revoke an intermediate key without a change for the clients.
+
+**Request flow**
+
+```mermaid
+flowchart LR
+    client([Client]) --> router["Routing layer<br/>(forward proxy)"]
+    router -->|"key_id → partition"| s1["Signing service A"]
+    router -->|"key_id → partition"| s2["Signing service B"]
+    router -->|"key_id → partition"| s3["Signing service C"]
+    s1 --> h1[("HSM A<br/>intermediate keys")]
+    s2 --> h2[("HSM B<br/>intermediate keys")]
+    s3 --> h3[("HSM C<br/>intermediate keys")]
+    root[("Offline root HSM")] -.->|"signs intermediate certificates<br/>(key ceremony only)"| h1
+    root -.-> h2
+    root -.-> h3
+```
+
+- **Signing services:** Each service is the service of this project. It connects to one HSM (or one partition) and serves the keys of that HSM. It stays small and has no knowledge of the other services.
+- **Routing layer:** A stateless forward proxy receives every request. It reads the `key_id` and sends the request to the service that holds that key. A table maps each `key_id` to a partition. It comes from configuration or from a registry that the key ceremony updates. You can run many copies of the router.
+
+**What the routing layer does for the services**
+
+- **Authentication and authorization:** The router authenticates the client, for example with mutual TLS, and checks which client may use which `key_id`. The signing services then accept connections only from the router, so they need no authentication of their own.
+- **Key validation:** The router must know which keys it can route to which HSM cluster, so it can also check the `key_id`. It rejects a request for an unknown or not routable key at once, with a clear error, and the request never reaches an HSM. For the same reason, it can apply admission control for each key or each HSM cluster (see Load shedding).
+- **Admission control:** The router applies a global limit and a limit for each client. Each service keeps its own limit, so one busy HSM does not use up the places of the others.
+- **Other jobs:** TLS, audit records, metrics, and a single public address and API.
+- **Load shedding:** The router can reject work early, at two levels.
+  - **Instance:** The router uses timeouts and a limit for each signing service, so it does not send more requests to an instance that is already overloaded.
+  - **Key or HSM:** The router limits the requests for each key or each HSM. When one HSM is overloaded, the router rejects more requests for its keys with `503`, and it does not add load to that HSM. The other HSMs are not affected.
+
+**Control plane**
+
+A control plane could manage the keys and tell the routing layer about them. It is separate from the signing path, so no signing request goes through it.
+
+- **Key management:** It adds, rotates and revokes signing keys. To add a key, it asks an HSM to generate the key, then gets a certificate for it from the root key in a key ceremony. To rotate a key, it adds a new key and then retires the old one. To revoke a key, it marks the key as not usable and publishes the revocation to the clients.
+- **Root key:** The root key is offline, so the control plane never connects to it. Adding a key is a manual process. The control plane has an HSM generate the key and a certificate request, and it marks the key as waiting. Operators sign the request with the root key in a key ceremony, with dual control. The control plane then stores the certificate, marks the key as active, and tells the routers. To reduce the work, one ceremony can sign the requests of many keys that were made in advance.
+- **Information for the routing layer:** It keeps the list of keys, the HSM cluster of each key, and the state of each key (for example active, retiring or revoked). It gives this list to the routers, so they route and validate requests from the same data.
+- **Availability:** The routers keep working with the last list they got if the control plane is not available. Only changes to keys wait for it. When a key is revoked or unknown and the control plane is not available, a router can remember the "key does not exist" error for a time that you set. Requests for that key then fail fast and do not reach an HSM. The router forgets the error when the time ends, or when the control plane is back and sends the new list of keys.
+- **Access:** Only a few trusted operators can use it, and it records every change in an audit log.
+
+**Effects and trade-offs**
+
+- **Scale:** The total throughput is about the sum of the throughput of the HSMs, if the load is spread over many keys. One very busy key still uses one HSM. Measure this on the real devices.
+- **Availability:** The loss of an HSM stops the keys on it. The other keys continue to work. To keep one key available, the HSM vendor must replicate it inside an HSM cluster. If you cannot do that, issue several intermediate keys for the same purpose on different HSMs, and let the router choose between them when the policy allows it.
+- **Cost:** The design adds one network hop, a new component that must be highly available, and a key-to-partition table that must stay correct. It also needs a key ceremony for the root key and a process to rotate and revoke intermediate keys.
+- **Risk:** If the root key is lost, you cannot issue new intermediate keys. If it is stolen, every key is not trusted. Protect it with dual control and backups according to the policy of your organization.
