@@ -106,6 +106,32 @@ where
         .with_state(state)
 }
 
+/// Sign the payload on a blocking thread, because the HSM backend is
+/// synchronous. Maps the backend errors to API errors.
+#[instrument(skip(state, payload))]
+async fn sign_blocking<B>(
+    state: &Arc<AppState<B>>,
+    key_id: String,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, ApiError>
+where
+    B: HsmBackend,
+{
+    // `spawn_blocking` needs a `'static` closure, so it gets its own copy.
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        state
+            .hsm_backend
+            .sign(&key_id, &payload)
+            .map_err(|e| match e {
+                HsmBackendError::KeyNotFound(_) => ApiError::KeyNotFound,
+                e => ApiError::Internal(e.to_string()),
+            })
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+}
+
 #[instrument(skip(state, request))]
 async fn handle_post_sign<B>(
     State(state): State<Arc<AppState<B>>>,
@@ -121,20 +147,7 @@ where
     let _permit = state.try_admit().ok_or(ApiError::Busy)?;
     let decoded_payload = BASE64.decode(&request.payload)?;
 
-    // `spawn_blocking` needs a `'static` closure, so it gets its own copies.
-    let backend_state = Arc::clone(&state);
-    let key_id = request.key_id.clone();
-    let signature = tokio::task::spawn_blocking(move || {
-        backend_state
-            .hsm_backend
-            .sign(&key_id, &decoded_payload)
-            .map_err(|e| match e {
-                HsmBackendError::KeyNotFound(_) => ApiError::KeyNotFound,
-                e => ApiError::Internal(e.to_string()),
-            })
-    })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))??;
+    let signature = sign_blocking(&state, request.key_id.clone(), decoded_payload).await?;
 
     let response = SignResponse {
         key_id: request.key_id,
@@ -155,6 +168,76 @@ mod tests {
         let config = Config::for_test("example", "test-pin");
         let app_state = AppState::try_new(&config, backend).expect("unable to build the state");
         State(Arc::new(app_state))
+    }
+
+    #[tokio::test]
+    async fn sign_blocking_returns_the_signature() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_sign()
+            .withf(|key_id, payload| key_id == "example" && payload == b"hello")
+            .times(1)
+            .returning(|_, _| Ok(vec![1, 2, 3]));
+        let state = state_with(backend).0;
+
+        let signature = sign_blocking(&state, "example".into(), b"hello".to_vec())
+            .await
+            .expect("expected a signature");
+
+        assert_eq!(signature, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn sign_blocking_maps_key_not_found() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_sign()
+            .times(1)
+            .returning(|key_id, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
+        let state = state_with(backend).0;
+
+        let err = sign_blocking(&state, "no-such-key".into(), vec![])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::KeyNotFound), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn sign_blocking_maps_other_backend_errors_to_internal() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_sign()
+            .times(1)
+            .returning(|_, _| Err(HsmBackendError::AmbiguousKey("secret-detail".into())));
+        let state = state_with(backend).0;
+
+        let err = sign_blocking(&state, "example".into(), vec![])
+            .await
+            .unwrap_err();
+
+        // The cause is kept for the log. The client message does not show it.
+        assert!(
+            matches!(&err, ApiError::Internal(cause) if cause.contains("secret-detail")),
+            "got {err:?}"
+        );
+        assert_eq!(err.to_string(), "Internal error");
+    }
+
+    #[tokio::test]
+    async fn sign_blocking_maps_a_panic_in_the_backend_to_internal() {
+        let mut backend = MockHsmBackend::new();
+        backend
+            .expect_sign()
+            .times(1)
+            .returning(|_, _| panic!("the backend panicked"));
+        let state = state_with(backend).0;
+
+        let err = sign_blocking(&state, "example".into(), vec![])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::Internal(_)), "got {err:?}");
     }
 
     #[tokio::test]
