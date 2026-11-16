@@ -15,6 +15,7 @@ use axum::middleware;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use axum::routing::get;
 use axum::routing::post;
 use base64::Engine;
 use base64::engine::GeneralPurpose;
@@ -137,7 +138,17 @@ where
     Router::new()
         .route("/v1/sign", post(handle_post_sign))
         .layer(middleware::from_fn_with_state(places, limit_requests))
+        // Added after the layer on purpose: the limit does not apply to the
+        // health check, so a busy service still answers it.
+        .route("/healthz", get(handle_get_healthz))
         .with_state(state)
+}
+
+/// The liveness check. It answers `200` with an empty body when the process
+/// serves HTTP. It does not call the HSM, so it does not show that signing
+/// works.
+async fn handle_get_healthz() -> StatusCode {
+    StatusCode::OK
 }
 
 /// Sign the payload on a blocking thread, because the HSM backend is
@@ -432,6 +443,55 @@ mod tests {
                 r#"{"key_id":"example","algorithm":"ECDSA_P256_SHA256","payload":"aGVsbG8="}"#,
             ))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn healthz_answers_200_and_does_not_call_the_backend() {
+        // A mock without expectations fails the test if the backend is called.
+        let app = router_with_one_place(MockHsmBackend::new());
+
+        let response = app
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "the body is not empty");
+    }
+
+    #[tokio::test]
+    async fn healthz_answers_200_when_the_limit_is_reached() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let mut backend = MockHsmBackend::new();
+        backend.expect_sign().times(1).returning(move |_, _| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(vec![1])
+        });
+        let app = router_with_one_place(backend);
+        let first = tokio::spawn(app.clone().oneshot(http_request()));
+        tokio::task::spawn_blocking(move || started_rx.recv())
+            .await
+            .unwrap()
+            .expect("the first request must reach the backend");
+
+        // The only place is in use: a sign request gets 503, the health check 200.
+        let sign = app.clone().oneshot(http_request()).await.unwrap();
+        let health = app
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(sign.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health.status(), StatusCode::OK);
+
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
     }
 
     #[tokio::test]

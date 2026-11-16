@@ -59,7 +59,7 @@ Starts the HTTP service.
 cargo run -- server
 ```
 
-The service has one endpoint: `POST /v1/sign`. The `key_id` field is the label of an EC P-256 private key in the token. The HSM hashes the payload with SHA-256 and signs it with ECDSA. The private key never leaves the HSM.
+The service has one API endpoint: `POST /v1/sign`. The `key_id` field is the label of an EC P-256 private key in the token. The HSM hashes the payload with SHA-256 and signs it with ECDSA. The private key never leaves the HSM.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/v1/sign \
@@ -225,7 +225,7 @@ Notes:
 - The image sets `HSM_SIGNING_SERVICE_HOST=0.0.0.0`, so the port is reachable from outside the container. The endpoint has no authentication. Publish the port only on a trusted interface (`127.0.0.1:` in the command above).
 - In a real deployment, give `HSM_PIN` to the container from a secret store (for example a Kubernetes `Secret`), not from a file in the repository. A real HSM replaces the volume: set `PKCS11_MODULE` to the library of the vendor.
 - The `setup` image runs `setup.sh`. It stops with an error if a key has wrong settings. It is safe to run again.
-- The image has no health check, because the service has no health endpoint.
+- The service has a liveness endpoint, `GET /healthz`, which replies with `HTTP 200` and an empty body when the process serves HTTP. It does not call the HSM, so it does not show that signing works (the service does not replace a session that the HSM closes). It is not limited by `HSM_SIGNING_SERVICE_MAX_QUEUE`, so a busy service still answers it.
 
 ## Benchmarks
 
