@@ -455,9 +455,7 @@ mod tests {
         let _lock = with_test_token();
         let config = Config::for_test(TOKEN_LABEL, "wrong-pin");
 
-        let error = CryptokiBackend::try_new(&config)
-            .err()
-            .expect("expected an error");
+        let error = CryptokiBackend::try_new(&config).expect_err("expected an error");
 
         let message = error.to_string();
         assert!(
@@ -472,9 +470,7 @@ mod tests {
         let _lock = with_test_token();
         let config = Config::for_test("no-such-token", PIN);
 
-        let error = CryptokiBackend::try_new(&config)
-            .err()
-            .expect("expected an error");
+        let error = CryptokiBackend::try_new(&config).expect_err("expected an error");
 
         assert!(
             error.to_string().contains("no token with the label"),
