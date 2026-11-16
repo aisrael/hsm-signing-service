@@ -341,3 +341,7 @@ A control plane could manage the keys and tell the routing layer about them. It 
 - **Availability:** The loss of an HSM stops the keys on it. The other keys continue to work. To keep one key available, the HSM vendor must replicate it inside an HSM cluster. If you cannot do that, issue several intermediate keys for the same purpose on different HSMs, and let the router choose between them when the policy allows it.
 - **Cost:** The design adds one network hop, a new component that must be highly available, and a key-to-partition table that must stay correct. It also needs a key ceremony for the root key and a process to rotate and revoke intermediate keys.
 - **Risk:** If the root key is lost, you cannot issue new intermediate keys. If it is stolen, every key is not trusted. Protect it with dual control and backups according to the policy of your organization.
+
+## License
+
+This project is licensed under the [GNU Affero General Public License, version 3 or later](LICENSE) (`AGPL-3.0-or-later`). If you modify the program and let users use it over a network, you must offer those users the source code of your modified version (section 13 of the license).
