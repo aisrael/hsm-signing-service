@@ -20,6 +20,7 @@
 mod common;
 
 use std::hint::black_box;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -86,5 +87,11 @@ fn bench_sign(c: &mut Criterion) {
     // The service stops when `service` is dropped.
 }
 
-criterion_group!(benches, bench_sign);
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(3))
+        .sample_size(1000);
+    targets = bench_sign
+}
 criterion_main!(benches);
