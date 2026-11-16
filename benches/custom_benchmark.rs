@@ -1,6 +1,7 @@
 //! A benchmark for `POST /v1/sign`.
 //!
-//! The benchmark starts the compiled service as a child process. Each caller
+//! The benchmark starts the compiled service as a child process, or, with
+//! `--hsm-signing-service-url`, uses a service that is already running. Each caller
 //! runs in its own thread and sends requests one after another. Each request has
 //! a payload of random words (3 to 10 words). The `--concurrency` (`-C`) option
 //! sets the number of callers (1 to 1000). Repeat it to run several levels one
@@ -11,6 +12,13 @@
 //!
 //! ```sh
 //! cargo bench --bench custom_benchmark -- --warmup-secs 5 --duration-secs 30 --seed 42 -C 1 -C 10 -C 100 -C 500
+//! ```
+//!
+//! To benchmark a running service, for example one that sends traces to a
+//! collector, start it and give its URL:
+//!
+//! ```sh
+//! cargo bench --bench custom_benchmark -- --hsm-signing-service-url http://localhost:8080 -C 10
 //! ```
 //!
 //! The `criterion_benchmark` benchmark sends the same requests with one caller
@@ -27,7 +35,7 @@ use std::time::Instant;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::Parser;
-use common::Service;
+use common::Target;
 use fake::Fake;
 use fake::faker::lorem::en::Sentence;
 use fake::rand::SeedableRng;
@@ -63,6 +71,12 @@ struct Args {
         value_parser = clap::value_parser!(u16).range(1..=1000),
     )]
     concurrency: Vec<u16>,
+    /// The base URL of a running service, for example `http://localhost:8080`.
+    /// The benchmark sends its requests there and does not start a service. The
+    /// service must use the same token label as `HSM_TOKEN_LABEL`. Without this
+    /// option, the benchmark starts its own service.
+    #[arg(long)]
+    hsm_signing_service_url: Option<String>,
     /// Cargo passes this flag to every benchmark. The benchmark ignores it.
     #[arg(long, hide = true)]
     bench: bool,
@@ -280,9 +294,10 @@ fn print_report(report: &Report) {
 fn main() {
     let args = Args::parse();
 
-    let service = Service::start();
-    let url = service.url("/v1/sign");
+    let target = Target::connect(args.hsm_signing_service_url.as_deref());
+    let url = target.url("/v1/sign");
     let key_id = common::env_var("HSM_TOKEN_LABEL");
+    println!("target: {}", target.describe());
 
     for &concurrency in &args.concurrency {
         println!("\n== {concurrency} concurrent callers ==");
@@ -306,5 +321,6 @@ fn main() {
         print_report(&report);
     }
 
-    // The service stops when `service` is dropped.
+    // A service that the benchmark started stops when `target` is dropped. A
+    // running service keeps running.
 }

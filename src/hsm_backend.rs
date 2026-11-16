@@ -1,5 +1,6 @@
 //! The HSM backend trait and its implementation for SoftHSM2.
 
+use std::ops::Deref;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
@@ -28,6 +29,8 @@ use secrecy::ExposeSecret;
 
 use crate::algorithm::Algorithm;
 use crate::config::Config;
+use crate::metrics::GaugeGuard;
+use crate::metrics::Metrics;
 use crate::utils::der_to_raw_signature;
 use crate::utils::raw_to_der_signature;
 
@@ -322,9 +325,13 @@ fn sign_with(
 ) -> Result<Vec<u8>, HsmBackendError> {
     let key = find_key_for(session, key_id, algorithm, ObjectClass::PRIVATE_KEY)?;
 
-    let raw = session
-        .sign(&algorithm.mechanism(), key, payload)
-        .map_err(HsmBackendError::Sign)?;
+    // Only the PKCS#11 call is inside the span: this is the time of the HSM,
+    // without the key lookup.
+    let raw = tracing::info_span!("hsm_sign", algorithm = algorithm.name()).in_scope(|| {
+        session
+            .sign(&algorithm.mechanism(), key, payload)
+            .map_err(HsmBackendError::Sign)
+    })?;
     match algorithm.ecdsa_component_len() {
         Some(component_len) => raw_to_der_signature(&raw, component_len),
         None => Ok(raw),
@@ -467,9 +474,36 @@ pub struct CryptokiBackendWithSessionPool {
     /// is not used for operations. `Session` is not `Sync`, so it sits behind
     /// a `Mutex`.
     _login_session: Mutex<Session>,
+    /// The instruments. They record nothing until `with_metrics` sets them.
+    metrics: Metrics,
+}
+
+/// A session that is taken from the pool. It derefs to the `Session`. While it
+/// lives, the gauge `pool.sessions_in_use` counts it.
+struct HeldSession {
+    // The session goes back to the pool first, then the gauge goes down. For a
+    // moment the gauge shows a session in use that is already free, never the
+    // other way round.
+    session: PooledSession,
+    _in_use: GaugeGuard,
+}
+
+impl Deref for HeldSession {
+    type Target = Session;
+
+    fn deref(&self) -> &Session {
+        &self.session
+    }
 }
 
 impl CryptokiBackendWithSessionPool {
+    /// Report the pool size and the sessions in use with these instruments.
+    pub fn with_metrics(mut self, metrics: &Metrics) -> Self {
+        metrics.set_pool_size(self.pool.max_size());
+        self.metrics = metrics.clone();
+        self
+    }
+
     /// Load the PKCS#11 module, find the token by its label, log in as the
     /// normal user (once), and open `pool_size` sessions. It fails at once if
     /// the login fails or if the pool cannot open all of its sessions.
@@ -505,14 +539,22 @@ impl CryptokiBackendWithSessionPool {
         Ok(CryptokiBackendWithSessionPool {
             pool,
             _login_session: Mutex::new(login_session),
+            metrics: Metrics::noop(),
         })
     }
 
     /// Take a session from the pool. It goes back to the pool when it is
     /// dropped. This blocks until a session is free, for at most
     /// the pool connection timeout from the `Config`.
-    fn session(&self) -> Result<PooledSession, HsmBackendError> {
-        self.pool.get().map_err(HsmBackendError::Checkout)
+    fn session(&self) -> Result<HeldSession, HsmBackendError> {
+        // The span is the time that the request waits for a free session.
+        let session = tracing::info_span!("pool_checkout")
+            .in_scope(|| self.pool.get().map_err(HsmBackendError::Checkout))?;
+        // Count the session only after the checkout worked.
+        Ok(HeldSession {
+            session,
+            _in_use: self.metrics.session_in_use(),
+        })
     }
 }
 
@@ -1299,6 +1341,106 @@ mod tests {
                 .verify(payload, &signature)
                 .expect("the signature does not verify");
         }
+    }
+
+    #[test]
+    fn sign_makes_a_span_for_the_checkout_and_one_for_the_hsm_call() {
+        use opentelemetry::trace::TraceContextExt;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+        use crate::telemetry::testing;
+
+        let _lock = with_test_token();
+        testing::exporter();
+        generate_key_pair("example-span-key");
+        let backend =
+            CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 1)
+                .unwrap();
+
+        // The test span is the parent. It has a unique name, because the
+        // exporter is shared with other tests.
+        let root = tracing::info_span!("backend_spans_test_root");
+        let root_id = root.in_scope(|| {
+            backend
+                .sign("example-span-key", Algorithm::EcdsaP256Sha256, b"hello")
+                .expect("expected a signature");
+            tracing::Span::current()
+                .context()
+                .span()
+                .span_context()
+                .span_id()
+        });
+        drop(root);
+
+        let spans = testing::finished_spans();
+        let children: Vec<_> = spans
+            .iter()
+            .filter(|span| span.parent_span_id == root_id)
+            .collect();
+        let checkout = children
+            .iter()
+            .find(|span| span.name == "pool_checkout")
+            .expect("no pool_checkout span");
+        let sign = children
+            .iter()
+            .find(|span| span.name == "hsm_sign")
+            .expect("no hsm_sign span");
+        assert_eq!(
+            testing::attribute(sign, "algorithm").unwrap(),
+            "ECDSA_P256_SHA256"
+        );
+        // The wait for the session is over before the HSM call starts.
+        assert!(checkout.end_time <= sign.start_time);
+    }
+
+    #[test]
+    fn the_pool_reports_its_size_and_the_sessions_in_use() {
+        use crate::metrics::testing::TestMetrics;
+
+        let _lock = with_test_token();
+        generate_key_pair("example-gauge-key");
+        let test = TestMetrics::new();
+        let backend =
+            CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 3)
+                .unwrap()
+                .with_metrics(&test.metrics);
+        assert_eq!(test.value("hsm_signing.pool.size"), Some(3));
+        assert_eq!(test.value("hsm_signing.pool.sessions_in_use"), None);
+
+        let first = backend.session().unwrap();
+        let second = backend.session().unwrap();
+        assert_eq!(test.value("hsm_signing.pool.sessions_in_use"), Some(2));
+        drop(first);
+        assert_eq!(test.value("hsm_signing.pool.sessions_in_use"), Some(1));
+        drop(second);
+        assert_eq!(test.value("hsm_signing.pool.sessions_in_use"), Some(0));
+
+        // `sign` takes a session and gives it back, with success and with an error.
+        backend
+            .sign("example-gauge-key", Algorithm::EcdsaP256Sha256, b"hello")
+            .expect("expected a signature");
+        backend
+            .sign("no-such-key", Algorithm::EcdsaP256Sha256, b"hello")
+            .expect_err("expected an error");
+        assert_eq!(test.value("hsm_signing.pool.sessions_in_use"), Some(0));
+    }
+
+    #[test]
+    fn a_failed_checkout_is_not_counted_as_a_session_in_use() {
+        use crate::metrics::testing::TestMetrics;
+
+        let _lock = with_test_token();
+        let test = TestMetrics::new();
+        // The wait for a session ends after the pool connection timeout.
+        let backend =
+            CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 1)
+                .unwrap()
+                .with_metrics(&test.metrics);
+
+        let _only = backend.session().unwrap();
+        assert!(backend.session().is_err());
+
+        assert_eq!(test.value("hsm_signing.pool.sessions_in_use"), Some(1));
     }
 
     #[test]
