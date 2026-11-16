@@ -21,6 +21,13 @@ export AES_KEY_LABEL="example-aes"
 # Use the same characters as for the AES key label.
 export EXPORTABLE_KEY_LABEL="example-exportable"
 
+# The labels of the other signing keys. `setup.sh` creates them, and the
+# integration tests use them: an EC P-384 key pair, an EC P-521 key pair and a
+# 2048-bit RSA key pair. Use the same characters as for the AES key label.
+export P384_KEY_LABEL="example-p384"
+export P521_KEY_LABEL="example-p521"
+export RSA_KEY_LABEL="example-rsa"
+
 # The service address and port to bind to
 export HSM_SIGNING_SERVICE_HOST="127.0.0.1"
 export HSM_SIGNING_SERVICE_PORT="8080"

@@ -49,7 +49,7 @@ Required tools:
 - softhsm2-util ([`brew install softhsm`](https://formulae.brew.sh/formula/softhsm))
 - pkcs11-tool ([`brew install opensc`](https://formulae.brew.sh/formula/opensc))
 
-**SoftHSM version:** Use SoftHSM 2.7.0 or later. The `server` and `verify` commands sign and verify with the mechanism `CKM_ECDSA_SHA256`, which SoftHSM supports from 2.7.0 (the release notes say "Added support for ECDSA with hashing"). With an older version, such as 2.6.1 (the version in the Ubuntu package), signing fails with `MechanismInvalid`. To check your version, run `softhsm2-util --version`.
+**SoftHSM version:** Use SoftHSM 2.7.0 or later. The `server` signs with the mechanisms in the algorithm table (see [Usage](#usage)), and `verify` uses `CKM_ECDSA_SHA256`. SoftHSM supports the ECDSA mechanisms with hashing, such as `CKM_ECDSA_SHA256`, from 2.7.0 (the release notes say "Added support for ECDSA with hashing"). With an older version, such as 2.6.1 (the version in the Ubuntu package), signing fails with `MechanismInvalid`. To check your version, run `softhsm2-util --version`.
 
 ### Environment variables
 
@@ -92,6 +92,15 @@ curl -X POST http://127.0.0.1:8080/v1/sign \
   -d '{"key_id": "example", "algorithm": "ECDSA_P256_SHA256", "payload": "aGVsbG8gd29ybGQ="}'
 ```
 
+The `algorithm` field chooses the mechanism. The HSM hashes the payload. The key with the label `key_id` must fit the algorithm: the key type, and for ECDSA the curve. If no such key exists, the service answers `422` (the same answer as for an unknown key) and does not sign.
+
+| `algorithm` | Mechanism | Key | Signature |
+| --- | --- | --- | --- |
+| `ECDSA_P256_SHA256` | `CKM_ECDSA_SHA256` | EC, P-256 | DER |
+| `ECDSA_P384_SHA384` | `CKM_ECDSA_SHA384` | EC, P-384 | DER |
+| `ECDSA_P521_SHA512` | `CKM_ECDSA_SHA512` | EC, P-521 | DER |
+| `RSA_PKCS1_SHA256` | `CKM_SHA256_RSA_PKCS` | RSA (`setup.sh` makes 2048 bits) | Raw bytes, as long as the key modulus |
+
 **Warning:** The endpoint has no authentication. Anyone who can reach it can sign data with the keys in the token. Keep the default address (`127.0.0.1`) unless you add access control.
 
 ### Environment variables reference
@@ -109,6 +118,7 @@ curl -X POST http://127.0.0.1:8080/v1/sign \
 | `HSM_SIGNING_SERVICE_MAX_QUEUE` | No | How many requests can wait for a free session, in addition to the requests that use a session. The server answers more requests at once with `503` and a `Retry-After` header. Use a whole number of 0 or more. With `0`, no request waits. The default is `20`. |
 | `AES_KEY_LABEL` | Setup only | The label of the AES-256 key. `setup.sh` creates it. |
 | `EXPORTABLE_KEY_LABEL` | Setup only | The label of the EC P-256 key pair that `wrap` wraps. `setup.sh` creates it. |
+| `P384_KEY_LABEL`, `P521_KEY_LABEL`, `RSA_KEY_LABEL` | Setup and tests | The labels of the EC P-384, EC P-521 and RSA 2048 key pairs. `setup.sh` creates them, and the integration tests use them. |
 
 ## Container image
 
@@ -135,7 +145,8 @@ Create the token and keys in a named volume. The commands use the environment va
 ```sh
 docker volume create example-hsm-tokens
 docker run --rm -v example-hsm-tokens:/var/lib/softhsm/tokens \
-  -e HSM_TOKEN_LABEL -e AES_KEY_LABEL -e EXPORTABLE_KEY_LABEL -e HSM_SO_PIN -e HSM_PIN \
+  -e HSM_TOKEN_LABEL -e AES_KEY_LABEL -e EXPORTABLE_KEY_LABEL \
+  -e P384_KEY_LABEL -e P521_KEY_LABEL -e RSA_KEY_LABEL -e HSM_SO_PIN -e HSM_PIN \
   example-hsm-signing-service-setup
 ```
 
@@ -202,8 +213,8 @@ cargo bench --bench criterion_benchmark -- --baseline before
 
 ## Assumptions
 
-- **Prototype:** The project is a development prototype. It needs a recent SoftHSM (see [Setup](#setup)). A real HSM is assumed to support the mechanism `CKM_ECDSA_SHA256` and to work through `PKCS11_MODULE`.
-- **Keys:** `key_id` is the label of an EC P-256 private key. Labels are unique. The public key has the same label as the private key, so `verify` can find it.
+- **Prototype:** The project is a development prototype. It needs a recent SoftHSM (see [Setup](#setup)). A real HSM is assumed to support the mechanisms of the algorithms that you use (for example `CKM_ECDSA_SHA256`) and to work through `PKCS11_MODULE`.
+- **Keys:** `key_id` is the label of a private key. Its type and curve must fit the `algorithm` of the request. Labels are unique. The public key has the same label as the private key, so `verify` can find it.
 - **Signing:** `payload` is the message, and the HSM hashes it with SHA-256. Signatures are DER-encoded.
 - **Network:** The service _MUST_ run on a trusted network.
 - **Instances:** With SoftHSM, run one service instance for each token volume. A real HSM may serve many instances.
@@ -271,7 +282,7 @@ This project is a prototype. Before you use the design in production, think abou
 - **Auto-scaling:** Make the service scale with the traffic. Emit metrics in the Prometheus format (a `/metrics` endpoint) that an autoscaler can use, for example a KEDA `ScaledObject` in Kubernetes. Good signals are the number of requests in the service, the queue length, the rate of `503` answers, and the signing latency. Set a minimum number of instances for availability, and a maximum number that the HSM can serve: the number of instances times the pool size must stay under the session limit of the HSM. Scale up fast and scale down slowly, because a new instance must connect to the HSM and log in before it can serve requests, and a readiness check must tell the autoscaler when it is ready.
 - **Tuning:** Set the pool size, the queue size and the pool timeout from a benchmark on the real HSM, from a clean build on a quiet machine. Count `503` and `504` separately.
 - **CI:** Run the integration tests and build the container image in CI.
-- **Algorithms:** Today the service supports one algorithm. More algorithms need new checks of the key type, the mechanism and the signature format.
+- **Algorithms:** The service supports four algorithms (see [Usage](#usage)). SoftHSM 2.7.0 also supports RSA-PSS and EdDSA (Ed25519). To add one, add a variant to `Algorithm` with its mechanism, key type and signature format, and a key to `setup.sh`.
 
 ### Federated signing design
 
@@ -305,7 +316,7 @@ flowchart LR
 **What the routing layer does for the services**
 
 - **Authentication and authorization:** The router authenticates the client, for example with mutual TLS, and checks which client may use which `key_id`. The signing services then accept connections only from the router, so they need no authentication of their own.
-- **Key validation:** The router must know which keys it can route to which HSM cluster, so it can also check the `key_id`. It rejects a request for an unknown or not routable key at once, with a clear error, and the request never reaches an HSM. For the same reason, it can apply admission control for each key or each HSM cluster (see Load shedding).
+- **Key validation:** The router must know which keys it can route to which HSM cluster, so it can also check the `key_id`. It rejects a request for an unknown or not routable key at once, with a clear error, and the request never reaches an HSM. It can also reject an unknown or unsupported `algorithm`, and an algorithm that does not match the type of the key (for example an RSA algorithm for an EC key), in the same way. The router can cache the list of keys and the algorithms that each key allows, so these checks need no call to an HSM or to a signing service. For the same reason, it can apply admission control for each key or each HSM cluster (see Load shedding).
 - **Admission control:** The router applies a global limit and a limit for each client. Each service keeps its own limit, so one busy HSM does not use up the places of the others.
 - **Other jobs:** TLS, audit records, metrics, and a single public address and API.
 - **Load shedding:** The router can reject work early, at two levels.
@@ -318,7 +329,7 @@ A control plane could manage the keys and tell the routing layer about them. It 
 
 - **Key management:** It adds, rotates and revokes signing keys. To add a key, it asks an HSM to generate the key, then gets a certificate for it from the root key in a key ceremony. To rotate a key, it adds a new key and then retires the old one. To revoke a key, it marks the key as not usable and publishes the revocation to the clients.
 - **Root key:** The root key is offline, so the control plane never connects to it. Adding a key is a manual process. The control plane has an HSM generate the key and a certificate request, and it marks the key as waiting. Operators sign the request with the root key in a key ceremony, with dual control. The control plane then stores the certificate, marks the key as active, and tells the routers. To reduce the work, one ceremony can sign the requests of many keys that were made in advance.
-- **Information for the routing layer:** It keeps the list of keys, the HSM cluster of each key, and the state of each key (for example active, retiring or revoked). It gives this list to the routers, so they route and validate requests from the same data.
+- **Information for the routing layer:** It keeps the list of keys, the HSM cluster of each key, the type of each key and the algorithms that it allows, and the state of each key (for example active, retiring or revoked). It gives this list to the routers, so they route and validate requests from the same data.
 - **Availability:** The routers keep working with the last list they got if the control plane is not available. Only changes to keys wait for it. When a key is revoked or unknown and the control plane is not available, a router can remember the "key does not exist" error for a time that you set. Requests for that key then fail fast and do not reach an HSM. The router forgets the error when the time ends, or when the control plane is back and sends the new list of keys.
 - **Access:** Only a few trusted operators can use it, and it records every change in an audit log.
 

@@ -20,6 +20,21 @@ if [ -z "$EXPORTABLE_KEY_LABEL" ]; then
     exit 1
 fi
 
+if [ -z "$P384_KEY_LABEL" ]; then
+    echo "Error: P384_KEY_LABEL is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
+    exit 1
+fi
+
+if [ -z "$P521_KEY_LABEL" ]; then
+    echo "Error: P521_KEY_LABEL is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
+    exit 1
+fi
+
+if [ -z "$RSA_KEY_LABEL" ]; then
+    echo "Error: RSA_KEY_LABEL is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
+    exit 1
+fi
+
 if [ -z "$HSM_SO_PIN" ]; then
     echo "Error: HSM_SO_PIN is not set. Please set it in your environment (or copy \`.envrc.example\` to \`.envrc\` and use \`direnv allow\`)" >&2
     exit 1
@@ -132,6 +147,31 @@ else
     echo "Generating the exportable EC key pair..."
     pkcs11 --keypairgen --key-type EC:prime256v1 --id 03 --label "$EXPORTABLE_KEY_LABEL" \
         --usage-sign --sensitive --extractable
+fi
+
+################################################################################
+# Create the other signing key pairs if they don't already exist. The private
+# keys are never extractable.
+
+if has_object "$P384_KEY_LABEL" privkey; then
+    echo "P-384 key already generated. Skipping."
+else
+    echo "Generating the EC P-384 key pair..."
+    pkcs11 --keypairgen --key-type EC:secp384r1 --id 04 --label "$P384_KEY_LABEL" --usage-sign
+fi
+
+if has_object "$P521_KEY_LABEL" privkey; then
+    echo "P-521 key already generated. Skipping."
+else
+    echo "Generating the EC P-521 key pair..."
+    pkcs11 --keypairgen --key-type EC:secp521r1 --id 05 --label "$P521_KEY_LABEL" --usage-sign
+fi
+
+if has_object "$RSA_KEY_LABEL" privkey; then
+    echo "RSA key already generated. Skipping."
+else
+    echo "Generating the RSA 2048 key pair..."
+    pkcs11 --keypairgen --key-type rsa:2048 --id 06 --label "$RSA_KEY_LABEL" --usage-sign
 fi
 
 # No other key in the token may be extractable.

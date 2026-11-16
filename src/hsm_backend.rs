@@ -19,7 +19,6 @@ use cryptoki::session::Session;
 use cryptoki::session::UserType;
 use cryptoki::slot::Slot;
 use cryptoki::types::AuthPin;
-use p256::ecdsa::Signature;
 use r2d2_cryptoki::Pool;
 use r2d2_cryptoki::PooledSession;
 use r2d2_cryptoki::SessionAuth;
@@ -27,8 +26,10 @@ use r2d2_cryptoki::SessionManager;
 use r2d2_cryptoki::r2d2;
 use secrecy::ExposeSecret;
 
+use crate::algorithm::Algorithm;
 use crate::config::Config;
 use crate::utils::der_to_raw_signature;
+use crate::utils::raw_to_der_signature;
 
 /// Errors from the HSM backend. No message may contain the PIN.
 #[derive(Debug, thiserror::Error)]
@@ -58,11 +59,11 @@ pub enum HsmBackendError {
     #[error("the HSM failed to sign: {0}")]
     Sign(#[source] CryptokiError),
     #[error("the HSM returned an invalid signature: {0}")]
-    InvalidSignature(#[source] p256::ecdsa::Error),
+    InvalidSignature(&'static str),
     #[error("the HSM failed to verify the signature: {0}")]
     Verify(#[source] CryptokiError),
-    #[error("the signature is not a valid DER-encoded ECDSA signature: {0}")]
-    InvalidSignatureEncoding(#[source] p256::ecdsa::Error),
+    #[error("the signature has the wrong encoding: {0}")]
+    InvalidSignatureEncoding(&'static str),
     #[error("the HSM failed to generate a random IV: {0}")]
     GenerateIv(#[source] CryptokiError),
     #[error("the HSM failed to encrypt: {0}")]
@@ -84,18 +85,30 @@ const GCM_MIN_LEN: usize = GCM_IV_LEN as usize + (GCM_TAG_BITS / 8) as usize;
 
 #[cfg_attr(test, mockall::automock)]
 pub trait HsmBackend: Send + Sync + 'static {
-    /// Sign the given payload using the specified key.
-    fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, HsmBackendError>;
+    /// Sign the given payload with the private key that has the label `key_id`,
+    /// using the mechanism of `algorithm` inside the HSM. The HSM hashes the
+    /// payload. The result is DER for ECDSA and the raw bytes for RSA.
+    ///
+    /// It fails with `KeyNotFound` if no key has the label and fits the
+    /// algorithm (the key type, and for ECDSA the curve). This method blocks.
+    fn sign(
+        &self,
+        key_id: &str,
+        algorithm: Algorithm,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, HsmBackendError>;
 
-    /// Verify a DER-encoded ECDSA signature of `payload` with the EC public
-    /// key that has the label `key_id`, using `CKM_ECDSA_SHA256` inside the HSM.
+    /// Verify a signature of `payload` (in the form that `sign` returns) with
+    /// the public key that has the label `key_id`, using the mechanism of
+    /// `algorithm` inside the HSM.
     ///
     /// Return `Ok(false)` if the signature does not match. Return an error if
-    /// the key does not exist, if `signature` is not valid DER, or if the HSM
-    /// fails. This method blocks.
+    /// the key does not exist or does not fit the algorithm, if an ECDSA
+    /// `signature` is not valid DER, or if the HSM fails. This method blocks.
     fn verify(
         &self,
         key_id: &str,
+        algorithm: Algorithm,
         payload: &[u8],
         signature: &[u8],
     ) -> Result<bool, HsmBackendError>;
@@ -224,14 +237,23 @@ fn find_private_keys(session: &Session, key_id: &str) -> Result<Vec<ObjectHandle
     session.find_objects(&template)
 }
 
-/// Find the EC public keys that have the label `key_id`. The label is
-/// matched as exact bytes.
-fn find_public_keys(session: &Session, key_id: &str) -> Result<Vec<ObjectHandle>, CryptokiError> {
-    let template = [
-        Attribute::Class(ObjectClass::PUBLIC_KEY),
-        Attribute::KeyType(KeyType::EC),
+/// Find the keys of the class `class` that have the label `key_id` and fit
+/// `algorithm`: the key type, and for ECDSA the curve. The label is matched as
+/// exact bytes.
+fn find_keys_for(
+    session: &Session,
+    key_id: &str,
+    algorithm: Algorithm,
+    class: ObjectClass,
+) -> Result<Vec<ObjectHandle>, CryptokiError> {
+    let mut template = vec![
+        Attribute::Class(class),
+        Attribute::KeyType(algorithm.key_type()),
         Attribute::Label(key_id.as_bytes().to_vec()),
     ];
+    if let Some(ec_params) = algorithm.ec_params() {
+        template.push(Attribute::EcParams(ec_params.to_vec()));
+    }
     session.find_objects(&template)
 }
 
@@ -267,35 +289,60 @@ fn find_private_key(session: &Session, key_id: &str) -> Result<ObjectHandle, Hsm
     exactly_one(handles, key_id)
 }
 
-/// Find the one EC public key that has the label `key_id`.
-fn find_public_key(session: &Session, key_id: &str) -> Result<ObjectHandle, HsmBackendError> {
-    let handles = find_public_keys(session, key_id).map_err(HsmBackendError::FindKey)?;
+/// Find the one key of the class `class` that fits `algorithm`. One search
+/// only: a key with the label but the wrong type or curve is `KeyNotFound`.
+fn find_key_for(
+    session: &Session,
+    key_id: &str,
+    algorithm: Algorithm,
+    class: ObjectClass,
+) -> Result<ObjectHandle, HsmBackendError> {
+    let handles =
+        find_keys_for(session, key_id, algorithm, class).map_err(HsmBackendError::FindKey)?;
     exactly_one(handles, key_id)
 }
 
-/// Sign with `CKM_ECDSA_SHA256`. The HSM hashes the payload. The result is
-/// the signature in DER form (the HSM returns the raw `r || s`).
-fn sign_with(session: &Session, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
-    let key = find_private_key(session, key_id)?;
-
-    let raw = session
-        .sign(&Mechanism::EcdsaSha256, key, payload)
-        .map_err(HsmBackendError::Sign)?;
-    let signature = Signature::from_slice(&raw).map_err(HsmBackendError::InvalidSignature)?;
-    Ok(signature.to_der().as_bytes().to_vec())
+/// Convert a signature in the form of `sign` (DER for ECDSA, raw for RSA) to
+/// the form of the HSM.
+fn signature_for_hsm(algorithm: Algorithm, signature: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
+    match algorithm.ecdsa_component_len() {
+        Some(component_len) => der_to_raw_signature(signature, component_len),
+        None => Ok(signature.to_vec()),
+    }
 }
 
-/// Verify with `CKM_ECDSA_SHA256`. The HSM hashes the payload. `raw_signature`
-/// is the raw `r || s` form.
+/// Sign with the mechanism of `algorithm`. The HSM hashes the payload. For
+/// ECDSA the result is in DER form (the HSM returns the raw `r || s`). For RSA
+/// it is the raw signature.
+fn sign_with(
+    session: &Session,
+    key_id: &str,
+    algorithm: Algorithm,
+    payload: &[u8],
+) -> Result<Vec<u8>, HsmBackendError> {
+    let key = find_key_for(session, key_id, algorithm, ObjectClass::PRIVATE_KEY)?;
+
+    let raw = session
+        .sign(&algorithm.mechanism(), key, payload)
+        .map_err(HsmBackendError::Sign)?;
+    match algorithm.ecdsa_component_len() {
+        Some(component_len) => raw_to_der_signature(&raw, component_len),
+        None => Ok(raw),
+    }
+}
+
+/// Verify with the mechanism of `algorithm`. The HSM hashes the payload.
+/// `hsm_signature` is in the form of the HSM (raw `r || s` for ECDSA).
 fn verify_with(
     session: &Session,
     key_id: &str,
+    algorithm: Algorithm,
     payload: &[u8],
-    raw_signature: &[u8],
+    hsm_signature: &[u8],
 ) -> Result<bool, HsmBackendError> {
-    let key = find_public_key(session, key_id)?;
+    let key = find_key_for(session, key_id, algorithm, ObjectClass::PUBLIC_KEY)?;
 
-    match session.verify(&Mechanism::EcdsaSha256, key, payload, raw_signature) {
+    match session.verify(&algorithm.mechanism(), key, payload, hsm_signature) {
         Ok(()) => Ok(true),
         Err(CryptokiError::Pkcs11(RvError::SignatureInvalid | RvError::SignatureLenRange, _)) => {
             Ok(false)
@@ -371,18 +418,24 @@ fn wrap_with(
 }
 
 impl HsmBackend for CryptokiBackend {
-    fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
-        sign_with(&self.session(), key_id, payload)
+    fn sign(
+        &self,
+        key_id: &str,
+        algorithm: Algorithm,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, HsmBackendError> {
+        sign_with(&self.session(), key_id, algorithm, payload)
     }
 
     fn verify(
         &self,
         key_id: &str,
+        algorithm: Algorithm,
         payload: &[u8],
         signature: &[u8],
     ) -> Result<bool, HsmBackendError> {
-        let raw_signature = der_to_raw_signature(signature)?;
-        verify_with(&self.session(), key_id, payload, &raw_signature)
+        let hsm_signature = signature_for_hsm(algorithm, signature)?;
+        verify_with(&self.session(), key_id, algorithm, payload, &hsm_signature)
     }
 
     fn encrypt(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
@@ -464,20 +517,26 @@ impl CryptokiBackendWithSessionPool {
 }
 
 impl HsmBackend for CryptokiBackendWithSessionPool {
-    fn sign(&self, key_id: &str, payload: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
+    fn sign(
+        &self,
+        key_id: &str,
+        algorithm: Algorithm,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, HsmBackendError> {
         let session = self.session()?;
-        sign_with(&session, key_id, payload)
+        sign_with(&session, key_id, algorithm, payload)
     }
 
     fn verify(
         &self,
         key_id: &str,
+        algorithm: Algorithm,
         payload: &[u8],
         signature: &[u8],
     ) -> Result<bool, HsmBackendError> {
-        let raw_signature = der_to_raw_signature(signature)?;
+        let hsm_signature = signature_for_hsm(algorithm, signature)?;
         let session = self.session()?;
-        verify_with(&session, key_id, payload, &raw_signature)
+        verify_with(&session, key_id, algorithm, payload, &hsm_signature)
     }
 
     fn encrypt(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, HsmBackendError> {
@@ -617,6 +676,11 @@ mod tests {
     }
 
     fn generate_ec_key_pair(label: &str, extractable: bool) {
+        generate_ec_key_pair_on(label, Algorithm::EcdsaP256Sha256, extractable);
+    }
+
+    /// Open a read-write session on the test token, logged in.
+    fn test_session() -> Session {
         let config = Config::for_test(TOKEN_LABEL, PIN);
         let pkcs11 = load_pkcs11(&config).expect("unable to load the module");
         let slot = find_token_by_label(pkcs11, TOKEN_LABEL).expect("token not found");
@@ -625,9 +689,13 @@ mod tests {
             .expect("unable to open a session");
         // The login state belongs to the token. Another session may have logged in already.
         let _ = session.login(UserType::User, Some(&AuthPin::new(PIN.into())));
+        session
+    }
 
-        // DER of the OID for prime256v1 (P-256).
-        let ec_params = vec![0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+    /// Generate an EC key pair on the curve of `algorithm` inside the test token.
+    fn generate_ec_key_pair_on(label: &str, algorithm: Algorithm, extractable: bool) {
+        let session = test_session();
+        let ec_params = algorithm.ec_params().expect("not an EC algorithm").to_vec();
         let public = [
             Attribute::Label(label.as_bytes().to_vec()),
             Attribute::EcParams(ec_params),
@@ -646,6 +714,29 @@ mod tests {
             .expect("unable to generate the key pair");
     }
 
+    /// Generate a 2048-bit RSA key pair inside the test token. The private key
+    /// is not extractable.
+    fn generate_rsa_key_pair(label: &str) {
+        let session = test_session();
+        let public = [
+            Attribute::Label(label.as_bytes().to_vec()),
+            Attribute::ModulusBits(2048.into()),
+            Attribute::PublicExponent(vec![0x01, 0x00, 0x01]),
+            Attribute::Token(true),
+            Attribute::Verify(true),
+        ];
+        let private = [
+            Attribute::Label(label.as_bytes().to_vec()),
+            Attribute::Token(true),
+            Attribute::Sensitive(true),
+            Attribute::Extractable(false),
+            Attribute::Sign(true),
+        ];
+        session
+            .generate_key_pair(&Mechanism::RsaPkcsKeyPairGen, &public, &private)
+            .expect("unable to generate the key pair");
+    }
+
     #[test]
     fn sign_needs_an_exact_label_match() {
         let _lock = with_test_token();
@@ -653,7 +744,7 @@ mod tests {
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
 
         for label in ["example-exac", "EXAMPLE-EXACT", "example-exact "] {
-            let result = backend.sign(label, b"hello world");
+            let result = backend.sign(label, Algorithm::EcdsaP256Sha256, b"hello world");
             assert!(
                 matches!(result, Err(HsmBackendError::KeyNotFound(_))),
                 "label {label:?}: unexpected: {result:?}"
@@ -697,7 +788,7 @@ mod tests {
         let payload = b"hello world";
 
         let der = backend
-            .sign("example-sign", payload)
+            .sign("example-sign", Algorithm::EcdsaP256Sha256, payload)
             .expect("expected a signature");
 
         let signature = Signature::from_der(&der).expect("the signature is not valid DER");
@@ -711,9 +802,16 @@ mod tests {
         let _lock = with_test_token();
         generate_key_pair("example-verify");
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
-        let der = backend.sign("example-verify", b"hello world").unwrap();
+        let der = backend
+            .sign("example-verify", Algorithm::EcdsaP256Sha256, b"hello world")
+            .unwrap();
 
-        let result = backend.verify("example-verify", b"hello world", &der);
+        let result = backend.verify(
+            "example-verify",
+            Algorithm::EcdsaP256Sha256,
+            b"hello world",
+            &der,
+        );
 
         assert!(matches!(result, Ok(true)), "unexpected: {result:?}");
     }
@@ -724,10 +822,19 @@ mod tests {
         generate_key_pair("example-verify-payload");
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
         let der = backend
-            .sign("example-verify-payload", b"hello world")
+            .sign(
+                "example-verify-payload",
+                Algorithm::EcdsaP256Sha256,
+                b"hello world",
+            )
             .unwrap();
 
-        let result = backend.verify("example-verify-payload", b"hello World", &der);
+        let result = backend.verify(
+            "example-verify-payload",
+            Algorithm::EcdsaP256Sha256,
+            b"hello World",
+            &der,
+        );
 
         assert!(matches!(result, Ok(false)), "unexpected: {result:?}");
     }
@@ -738,14 +845,23 @@ mod tests {
         generate_key_pair("example-verify-changed");
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
         let der = backend
-            .sign("example-verify-changed", b"hello world")
+            .sign(
+                "example-verify-changed",
+                Algorithm::EcdsaP256Sha256,
+                b"hello world",
+            )
             .unwrap();
         // Change one bit inside `r`, then encode the signature as DER again.
         let mut raw = Signature::from_der(&der).unwrap().to_bytes();
         raw[5] ^= 0x01;
         let changed = Signature::from_slice(&raw).unwrap().to_der();
 
-        let result = backend.verify("example-verify-changed", b"hello world", changed.as_bytes());
+        let result = backend.verify(
+            "example-verify-changed",
+            Algorithm::EcdsaP256Sha256,
+            b"hello world",
+            changed.as_bytes(),
+        );
 
         assert!(matches!(result, Ok(false)), "unexpected: {result:?}");
     }
@@ -757,10 +873,19 @@ mod tests {
         generate_key_pair("example-verify-key-b");
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
         let der = backend
-            .sign("example-verify-key-a", b"hello world")
+            .sign(
+                "example-verify-key-a",
+                Algorithm::EcdsaP256Sha256,
+                b"hello world",
+            )
             .unwrap();
 
-        let result = backend.verify("example-verify-key-b", b"hello world", &der);
+        let result = backend.verify(
+            "example-verify-key-b",
+            Algorithm::EcdsaP256Sha256,
+            b"hello world",
+            &der,
+        );
 
         assert!(matches!(result, Ok(false)), "unexpected: {result:?}");
     }
@@ -771,7 +896,12 @@ mod tests {
         generate_key_pair("example-verify-garbage");
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
 
-        let result = backend.verify("example-verify-garbage", b"hello world", b"not a signature");
+        let result = backend.verify(
+            "example-verify-garbage",
+            Algorithm::EcdsaP256Sha256,
+            b"hello world",
+            b"not a signature",
+        );
 
         assert!(
             matches!(result, Err(HsmBackendError::InvalidSignatureEncoding(_))),
@@ -785,10 +915,19 @@ mod tests {
         generate_key_pair("example-verify-known");
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
         let der = backend
-            .sign("example-verify-known", b"hello world")
+            .sign(
+                "example-verify-known",
+                Algorithm::EcdsaP256Sha256,
+                b"hello world",
+            )
             .unwrap();
 
-        let result = backend.verify("no-such-key", b"hello world", &der);
+        let result = backend.verify(
+            "no-such-key",
+            Algorithm::EcdsaP256Sha256,
+            b"hello world",
+            &der,
+        );
 
         assert!(
             matches!(result, Err(HsmBackendError::KeyNotFound(_))),
@@ -802,9 +941,20 @@ mod tests {
         generate_key_pair("example-verify-sig");
         generate_aes_key("example-verify-aes");
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
-        let der = backend.sign("example-verify-sig", b"hello world").unwrap();
+        let der = backend
+            .sign(
+                "example-verify-sig",
+                Algorithm::EcdsaP256Sha256,
+                b"hello world",
+            )
+            .unwrap();
 
-        let result = backend.verify("example-verify-aes", b"hello world", &der);
+        let result = backend.verify(
+            "example-verify-aes",
+            Algorithm::EcdsaP256Sha256,
+            b"hello world",
+            &der,
+        );
 
         assert!(
             matches!(result, Err(HsmBackendError::KeyNotFound(_))),
@@ -1072,7 +1222,7 @@ mod tests {
         let _lock = with_test_token();
         let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
 
-        let result = backend.sign("no-such-key", b"hello world");
+        let result = backend.sign("no-such-key", Algorithm::EcdsaP256Sha256, b"hello world");
 
         assert!(
             matches!(result, Err(HsmBackendError::KeyNotFound(ref id)) if id == "no-such-key"),
@@ -1137,8 +1287,13 @@ mod tests {
             .map(|_| backend.session().expect("expected a session"))
             .collect();
         for session in &sessions {
-            let der = sign_with(session, "example-pool-sessions", payload)
-                .expect("a session of the pool cannot sign");
+            let der = sign_with(
+                session,
+                "example-pool-sessions",
+                Algorithm::EcdsaP256Sha256,
+                payload,
+            )
+            .expect("a session of the pool cannot sign");
             let signature = Signature::from_der(&der).expect("the signature is not valid DER");
             public_key("example-pool-sessions")
                 .verify(payload, &signature)
@@ -1190,7 +1345,11 @@ mod tests {
                     for call in 0..5 {
                         let payload = format!("payload {thread}-{call}");
                         let der = backend
-                            .sign("example-pool-threads", payload.as_bytes())
+                            .sign(
+                                "example-pool-threads",
+                                Algorithm::EcdsaP256Sha256,
+                                payload.as_bytes(),
+                            )
                             .expect("expected a signature");
                         let signature =
                             Signature::from_der(&der).expect("the signature is not valid DER");
@@ -1212,8 +1371,19 @@ mod tests {
                 .unwrap();
 
         for _ in 0..3 {
-            let der = backend.sign("example-pool-one", b"hello world").unwrap();
-            let result = backend.verify("example-pool-one", b"hello world", &der);
+            let der = backend
+                .sign(
+                    "example-pool-one",
+                    Algorithm::EcdsaP256Sha256,
+                    b"hello world",
+                )
+                .unwrap();
+            let result = backend.verify(
+                "example-pool-one",
+                Algorithm::EcdsaP256Sha256,
+                b"hello world",
+                &der,
+            );
             assert!(matches!(result, Ok(true)), "unexpected: {result:?}");
         }
     }
@@ -1225,11 +1395,110 @@ mod tests {
             CryptokiBackendWithSessionPool::try_new(&Config::for_test(TOKEN_LABEL, PIN), 2)
                 .unwrap();
 
-        let result = backend.sign("no-such-key", b"hello world");
+        let result = backend.sign("no-such-key", Algorithm::EcdsaP256Sha256, b"hello world");
 
         assert!(
             matches!(result, Err(HsmBackendError::KeyNotFound(ref id)) if id == "no-such-key"),
             "unexpected: {result:?}"
         );
+    }
+
+    #[test]
+    fn every_ecdsa_algorithm_signs_and_verifies() {
+        let _lock = with_test_token();
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let cases = [
+            (Algorithm::EcdsaP256Sha256, "example-algo-p256"),
+            (Algorithm::EcdsaP384Sha384, "example-algo-p384"),
+            (Algorithm::EcdsaP521Sha512, "example-algo-p521"),
+        ];
+        for (algorithm, label) in cases {
+            generate_ec_key_pair_on(label, algorithm, false);
+
+            let der = backend.sign(label, algorithm, b"hello world").unwrap();
+
+            let raw = der_to_raw_signature(&der, algorithm.ecdsa_component_len().unwrap())
+                .unwrap_or_else(|e| panic!("{algorithm:?}: {e}"));
+            assert_eq!(raw.len(), 2 * algorithm.ecdsa_component_len().unwrap());
+            let valid = backend.verify(label, algorithm, b"hello world", &der);
+            assert!(matches!(valid, Ok(true)), "{algorithm:?}: {valid:?}");
+            let other = backend.verify(label, algorithm, b"hello World", &der);
+            assert!(matches!(other, Ok(false)), "{algorithm:?}: {other:?}");
+        }
+    }
+
+    #[test]
+    fn rsa_signs_and_verifies() {
+        let _lock = with_test_token();
+        generate_rsa_key_pair("example-algo-rsa");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        let signature = backend
+            .sign(
+                "example-algo-rsa",
+                Algorithm::RsaPkcs1Sha256,
+                b"hello world",
+            )
+            .expect("expected a signature");
+
+        // RSA 2048: the signature has the length of the modulus.
+        assert_eq!(signature.len(), 256);
+        let valid = backend.verify(
+            "example-algo-rsa",
+            Algorithm::RsaPkcs1Sha256,
+            b"hello world",
+            &signature,
+        );
+        assert!(matches!(valid, Ok(true)), "unexpected: {valid:?}");
+        let other = backend.verify(
+            "example-algo-rsa",
+            Algorithm::RsaPkcs1Sha256,
+            b"hello World",
+            &signature,
+        );
+        assert!(matches!(other, Ok(false)), "unexpected: {other:?}");
+    }
+
+    #[test]
+    fn sign_reports_key_not_found_when_the_key_does_not_fit_the_algorithm() {
+        let _lock = with_test_token();
+        generate_ec_key_pair_on("example-mismatch-p256", Algorithm::EcdsaP256Sha256, false);
+        generate_ec_key_pair_on("example-mismatch-p384", Algorithm::EcdsaP384Sha384, false);
+        generate_rsa_key_pair("example-mismatch-rsa");
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+        let cases = [
+            ("example-mismatch-p256", Algorithm::RsaPkcs1Sha256),
+            ("example-mismatch-rsa", Algorithm::EcdsaP256Sha256),
+            // The key type is right, but the curve is wrong, in both directions.
+            ("example-mismatch-p256", Algorithm::EcdsaP384Sha384),
+            ("example-mismatch-p384", Algorithm::EcdsaP256Sha256),
+            ("example-mismatch-p384", Algorithm::EcdsaP521Sha512),
+        ];
+        for (label, algorithm) in cases {
+            let result = backend.sign(label, algorithm, b"hello world");
+            assert!(
+                matches!(result, Err(HsmBackendError::KeyNotFound(_))),
+                "{label} with {algorithm:?}: unexpected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_still_reports_an_unknown_label_for_every_algorithm() {
+        let _lock = with_test_token();
+        let backend = CryptokiBackend::try_new(&Config::for_test(TOKEN_LABEL, PIN)).unwrap();
+
+        for algorithm in [
+            Algorithm::EcdsaP256Sha256,
+            Algorithm::EcdsaP384Sha384,
+            Algorithm::EcdsaP521Sha512,
+            Algorithm::RsaPkcs1Sha256,
+        ] {
+            let result = backend.sign("no-such-key-anywhere", algorithm, b"hello world");
+            assert!(
+                matches!(result, Err(HsmBackendError::KeyNotFound(_))),
+                "{algorithm:?}: unexpected: {result:?}"
+            );
+        }
     }
 }

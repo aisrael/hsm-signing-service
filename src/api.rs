@@ -25,17 +25,11 @@ use tokio::sync::Semaphore;
 use tracing::instrument;
 use tracing::trace;
 
+use crate::algorithm::Algorithm;
 use crate::app_state::AppState;
 use crate::config::Config;
 use crate::hsm_backend::HsmBackend;
 use crate::hsm_backend::HsmBackendError;
-
-/// The algorithm to use for signing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Algorithm {
-    #[serde(rename = "ECDSA_P256_SHA256")]
-    EcdsaP256Sha256,
-}
 
 /// The request body for the POST /v1/sign endpoint.
 #[derive(Debug, Deserialize)]
@@ -159,6 +153,7 @@ async fn handle_get_healthz() -> StatusCode {
 async fn sign_blocking<B>(
     state: &Arc<AppState<B>>,
     key_id: String,
+    algorithm: Algorithm,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, ApiError>
 where
@@ -168,7 +163,7 @@ where
     tokio::task::spawn_blocking(move || {
         state
             .hsm_backend
-            .sign(&key_id, &payload)
+            .sign(&key_id, algorithm, &payload)
             .map_err(|e| match e {
                 HsmBackendError::KeyNotFound(_) => ApiError::KeyNotFound,
                 HsmBackendError::Checkout(_) => ApiError::Timeout,
@@ -191,7 +186,13 @@ where
     let start = Instant::now();
     let decoded_payload = BASE64.decode(&request.payload)?;
 
-    let signature = sign_blocking(&state, request.key_id.clone(), decoded_payload).await?;
+    let signature = sign_blocking(
+        &state,
+        request.key_id.clone(),
+        request.algorithm,
+        decoded_payload,
+    )
+    .await?;
 
     let response = SignResponse {
         key_id: request.key_id,
@@ -224,14 +225,19 @@ mod tests {
         let mut backend = MockHsmBackend::new();
         backend
             .expect_sign()
-            .withf(|key_id, payload| key_id == "example" && payload == b"hello")
+            .withf(|key_id, _, payload| key_id == "example" && payload == b"hello")
             .times(1)
-            .returning(|_, _| Ok(vec![1, 2, 3]));
+            .returning(|_, _, _| Ok(vec![1, 2, 3]));
         let state = state_with(backend).0;
 
-        let signature = sign_blocking(&state, "example".into(), b"hello".to_vec())
-            .await
-            .expect("expected a signature");
+        let signature = sign_blocking(
+            &state,
+            "example".into(),
+            Algorithm::EcdsaP256Sha256,
+            b"hello".to_vec(),
+        )
+        .await
+        .expect("expected a signature");
 
         assert_eq!(signature, vec![1, 2, 3]);
     }
@@ -242,12 +248,17 @@ mod tests {
         backend
             .expect_sign()
             .times(1)
-            .returning(|key_id, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
+            .returning(|key_id, _, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
         let state = state_with(backend).0;
 
-        let err = sign_blocking(&state, "no-such-key".into(), vec![])
-            .await
-            .unwrap_err();
+        let err = sign_blocking(
+            &state,
+            "no-such-key".into(),
+            Algorithm::EcdsaP256Sha256,
+            vec![],
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, ApiError::KeyNotFound), "got {err:?}");
     }
@@ -258,10 +269,10 @@ mod tests {
         backend
             .expect_sign()
             .times(1)
-            .returning(|_, _| Err(HsmBackendError::AmbiguousKey("secret-detail".into())));
+            .returning(|_, _, _| Err(HsmBackendError::AmbiguousKey("secret-detail".into())));
         let state = state_with(backend).0;
 
-        let err = sign_blocking(&state, "example".into(), vec![])
+        let err = sign_blocking(&state, "example".into(), Algorithm::EcdsaP256Sha256, vec![])
             .await
             .unwrap_err();
 
@@ -279,10 +290,10 @@ mod tests {
         backend
             .expect_sign()
             .times(1)
-            .returning(|_, _| panic!("the backend panicked"));
+            .returning(|_, _, _| panic!("the backend panicked"));
         let state = state_with(backend).0;
 
-        let err = sign_blocking(&state, "example".into(), vec![])
+        let err = sign_blocking(&state, "example".into(), Algorithm::EcdsaP256Sha256, vec![])
             .await
             .unwrap_err();
 
@@ -327,10 +338,10 @@ mod tests {
         backend
             .expect_sign()
             .times(1)
-            .returning(|_, _| Err(HsmBackendError::Checkout(checkout_error())));
+            .returning(|_, _, _| Err(HsmBackendError::Checkout(checkout_error())));
         let state = state_with(backend).0;
 
-        let err = sign_blocking(&state, "example".into(), vec![])
+        let err = sign_blocking(&state, "example".into(), Algorithm::EcdsaP256Sha256, vec![])
             .await
             .unwrap_err();
 
@@ -343,7 +354,7 @@ mod tests {
         backend
             .expect_sign()
             .times(1)
-            .returning(|_, _| Err(HsmBackendError::Checkout(checkout_error())));
+            .returning(|_, _, _| Err(HsmBackendError::Checkout(checkout_error())));
 
         let err = handle_post_sign(state_with(backend), request("example"))
             .await
@@ -364,9 +375,9 @@ mod tests {
         let mut backend = MockHsmBackend::new();
         backend
             .expect_sign()
-            .withf(|key_id, payload| key_id == "example" && payload == b"hello world")
+            .withf(|key_id, _, payload| key_id == "example" && payload == b"hello world")
             .times(1)
-            .returning(|_, payload| Ok(payload.to_vec()));
+            .returning(|_, _, payload| Ok(payload.to_vec()));
 
         let Json(response) = handle_post_sign(state_with(backend), Json(request))
             .await
@@ -376,6 +387,34 @@ mod tests {
         assert_eq!(response.algorithm, Algorithm::EcdsaP256Sha256);
         // The mock returns the payload as the signature.
         assert_eq!(response.signature, "aGVsbG8gd29ybGQ=");
+    }
+
+    #[tokio::test]
+    async fn handle_post_sign_gives_the_requested_algorithm_to_the_backend() {
+        let cases = [
+            (Algorithm::EcdsaP256Sha256, "ECDSA_P256_SHA256"),
+            (Algorithm::EcdsaP384Sha384, "ECDSA_P384_SHA384"),
+            (Algorithm::EcdsaP521Sha512, "ECDSA_P521_SHA512"),
+            (Algorithm::RsaPkcs1Sha256, "RSA_PKCS1_SHA256"),
+        ];
+        for (expected, name) in cases {
+            let request: SignRequest = serde_json::from_str(&format!(
+                r#"{{"key_id": "example", "algorithm": "{name}", "payload": "aGVsbG8="}}"#
+            ))
+            .expect("the request is valid");
+            let mut backend = MockHsmBackend::new();
+            backend
+                .expect_sign()
+                .withf(move |_, algorithm, _| *algorithm == expected)
+                .times(1)
+                .returning(|_, _, _| Ok(vec![1]));
+
+            let Json(response) = handle_post_sign(state_with(backend), Json(request))
+                .await
+                .expect("Expected Ok(Json(SignResponse))");
+
+            assert_eq!(response.algorithm, expected);
+        }
     }
 
     #[tokio::test]
@@ -413,9 +452,9 @@ mod tests {
         let mut backend = MockHsmBackend::new();
         backend
             .expect_sign()
-            .withf(|key_id, _| key_id == "no-such-key")
+            .withf(|key_id, _, _| key_id == "no-such-key")
             .times(1)
-            .returning(|key_id, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
+            .returning(|key_id, _, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
 
         let err = handle_post_sign(state_with(backend), request("no-such-key"))
             .await
@@ -467,7 +506,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let mut backend = MockHsmBackend::new();
-        backend.expect_sign().times(1).returning(move |_, _| {
+        backend.expect_sign().times(1).returning(move |_, _, _| {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             Ok(vec![1])
@@ -502,7 +541,7 @@ mod tests {
         let mut backend = MockHsmBackend::new();
         // Only the first request reaches the backend. A second call fails the
         // test.
-        backend.expect_sign().times(1).returning(move |_, _| {
+        backend.expect_sign().times(1).returning(move |_, _, _| {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             Ok(vec![1])
@@ -538,7 +577,7 @@ mod tests {
         backend
             .expect_sign()
             .times(30)
-            .returning(|_, _| Ok(vec![1, 2, 3]));
+            .returning(|_, _, _| Ok(vec![1, 2, 3]));
         // Only one place. More requests than places, one after another. Each
         // request must free its place, or a request would get 503.
         let app = router_with_one_place(backend);
@@ -555,7 +594,7 @@ mod tests {
         backend
             .expect_sign()
             .times(5)
-            .returning(|key_id, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
+            .returning(|key_id, _, _| Err(HsmBackendError::KeyNotFound(key_id.to_string())));
         let app = router_with_one_place(backend);
 
         for _ in 0..5 {
@@ -570,7 +609,7 @@ mod tests {
         backend
             .expect_sign()
             .times(1)
-            .returning(|_, _| Err(HsmBackendError::AmbiguousKey("secret-detail".into())));
+            .returning(|_, _, _| Err(HsmBackendError::AmbiguousKey("secret-detail".into())));
 
         let err = handle_post_sign(state_with(backend), request("example"))
             .await

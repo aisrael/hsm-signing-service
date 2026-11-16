@@ -67,3 +67,79 @@ fn post_sign_returns_a_der_signature() {
         body["duration_ms"]
     );
 }
+
+/// Send `POST /v1/sign` and return the status and the JSON body. A 4xx or 5xx
+/// answer is not an error here.
+fn post_sign(service: &Service, key_id: &str, algorithm: &str) -> (u16, Value) {
+    let request = json!({
+        "key_id": key_id,
+        "algorithm": algorithm,
+        "payload": "aGVsbG8gd29ybGQ=", // "hello world"
+    });
+    let mut response = ureq::post(service.url("/v1/sign"))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send_json(&request)
+        .expect("the request failed");
+    let status = response.status().as_u16();
+    let body: Value = response
+        .body_mut()
+        .read_json()
+        .expect("the response body is not valid JSON");
+    (status, body)
+}
+
+#[test]
+fn post_sign_signs_with_every_algorithm() {
+    let service = Service::start();
+    // The DER signature of an ECDSA algorithm has at most this many bytes
+    // (the sequence header, and two integers with a leading zero). RSA 2048
+    // gives 256 bytes.
+    let cases = [
+        ("P384_KEY_LABEL", "ECDSA_P384_SHA384", 104),
+        ("P521_KEY_LABEL", "ECDSA_P521_SHA512", 139),
+        ("RSA_KEY_LABEL", "RSA_PKCS1_SHA256", 256),
+    ];
+    for (label_variable, algorithm, max_len) in cases {
+        let key_id = common::env_var(label_variable);
+
+        let (status, body) = post_sign(&service, &key_id, algorithm);
+
+        assert_eq!(status, 200, "{algorithm}: {body}");
+        assert_eq!(body["algorithm"], algorithm);
+        let signature = BASE64
+            .decode(body["signature"].as_str().expect("no signature"))
+            .expect("the signature is not valid base64");
+        assert!(
+            signature.len() > 8 && signature.len() <= max_len,
+            "{algorithm}: unexpected signature length {}",
+            signature.len()
+        );
+        if algorithm == "RSA_PKCS1_SHA256" {
+            assert_eq!(signature.len(), 256);
+        } else {
+            assert_eq!(signature[0], 0x30, "{algorithm}: not a DER sequence");
+        }
+    }
+}
+
+#[test]
+fn post_sign_answers_422_when_the_key_does_not_fit_the_algorithm() {
+    let service = Service::start();
+    let rsa_key = common::env_var("RSA_KEY_LABEL");
+    let p384_key = common::env_var("P384_KEY_LABEL");
+
+    for (key_id, algorithm) in [
+        ("example", "RSA_PKCS1_SHA256"),
+        (rsa_key.as_str(), "ECDSA_P256_SHA256"),
+        // The key type is right, but the curve is wrong.
+        ("example", "ECDSA_P384_SHA384"),
+        (p384_key.as_str(), "ECDSA_P256_SHA256"),
+    ] {
+        let (status, body) = post_sign(&service, key_id, algorithm);
+
+        assert_eq!(status, 422, "{key_id} with {algorithm}: {body}");
+        assert_eq!(body["error"], "Key not found");
+    }
+}

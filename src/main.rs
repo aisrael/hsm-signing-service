@@ -1,5 +1,6 @@
 //! A simple HTTP service that signs payloads using a hardware security module (HSM).
 
+mod algorithm;
 mod api;
 mod app_state;
 mod cli;

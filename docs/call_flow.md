@@ -11,6 +11,8 @@ This document shows how the parts of the service work together and how the servi
 
 In unit tests, the implementation is `MockHsmBackend`.
 
+The `Algorithm` enum (`src/algorithm.rs`) says what each algorithm needs from the HSM: the PKCS#11 mechanism, the key type, for ECDSA the curve, and the size of `r` and `s`. The request field `algorithm` is passed to the backend.
+
 The router has a middleware that limits how many requests are in the service at the same time (see "Queue limit" below).
 
 ```mermaid
@@ -68,7 +70,7 @@ The HSM calls are blocking, so the handler runs them with `tokio::task::spawn_bl
 
 The diagram shows `CryptokiBackend`. `CryptokiBackendWithSessionPool` follows the same steps. The only difference is how it gets a session (see the note after the diagram).
 
-The private key never leaves the HSM. The HSM hashes the payload with SHA-256 and signs it (`CKM_ECDSA_SHA256`). It returns the signature as raw `r || s`. `CryptokiBackend` converts it to DER form.
+The private key never leaves the HSM. The HSM hashes the payload with the hash of the algorithm and signs it (for example `CKM_ECDSA_SHA256` for `ECDSA_P256_SHA256`). For ECDSA, it returns the signature as raw `r || s`, and the backend converts it to DER form. For RSA, the signature is returned as raw bytes.
 
 ```mermaid
 sequenceDiagram
@@ -96,24 +98,24 @@ sequenceDiagram
         Handler-->>Client: 400 {"error": "Unable to base64 decode payload: ..."}
     end
     Handler->>Pool: spawn_blocking(closure)
-    Pool->>Backend: sign(key_id, payload)
+    Pool->>Backend: sign(key_id, algorithm, payload)
     Backend->>Backend: Lock the session Mutex
-    Backend->>Cryptoki: find_objects(private key, EC, label = key_id)
+    Backend->>Cryptoki: find_objects(private key, key type and curve of the algorithm, label = key_id)
     Cryptoki->>HSM: C_FindObjects
     HSM-->>Cryptoki: object handles
     Cryptoki-->>Backend: handles
-    alt no private key has this label
+    alt no private key has this label and fits the algorithm<br/>(a key of the wrong type or curve counts as not found)
         Backend-->>Pool: Err(KeyNotFound)
         Pool-->>Handler: Err(ApiError::KeyNotFound)
         Handler-->>Client: 422 {"error": "Key not found"}
     end
-    Backend->>Cryptoki: sign(CKM_ECDSA_SHA256, key, payload)
+    Backend->>Cryptoki: sign(mechanism of the algorithm, key, payload)
     Cryptoki->>HSM: C_SignInit + C_Sign
-    HSM->>HSM: Hash the payload with SHA-256<br/>and sign it with the private key
-    HSM-->>Cryptoki: raw signature (r || s)
+    HSM->>HSM: Hash the payload with the hash of the algorithm<br/>and sign it with the private key
+    HSM-->>Cryptoki: raw signature (r || s for ECDSA)
     Cryptoki-->>Backend: raw signature
-    Backend->>Backend: Convert r || s to a DER signature
-    Backend-->>Pool: Ok(DER signature bytes)
+    Backend->>Backend: ECDSA only: convert r || s to a DER signature
+    Backend-->>Pool: Ok(signature bytes: DER for ECDSA, raw for RSA)
     alt the HSM fails or the key label is not unique
         Pool-->>Handler: Err(Internal)
         Handler-->>Client: 500 {"error": "Internal error"}<br/>(the cause goes to the log only)
@@ -139,7 +141,7 @@ sequenceDiagram
     participant R2d2 as r2d2 Pool
     participant HSM as SoftHSM2 token
 
-    Pool->>Backend: sign(key_id, payload)
+    Pool->>Backend: sign(key_id, algorithm, payload)
     Backend->>R2d2: get()
     alt no session is free after HSM_SIGNING_SERVICE_POOL_CONNECTION_TIMEOUT_MS
         R2d2-->>Backend: Err
@@ -149,7 +151,7 @@ sequenceDiagram
     Backend->>HSM: find the key, then sign (as in the diagram above)
     HSM-->>Backend: signature
     Backend->>R2d2: drop PooledSession (the session goes back to the pool)
-    Backend-->>Pool: Ok(DER signature bytes)
+    Backend-->>Pool: Ok(signature bytes)
 ```
 
 `sign_blocking` maps a checkout error to `ApiError::Timeout`, so the handler returns `504 {"error": "Request timed out"}`. A client can try again later. The queue limit keeps the number of waiting requests small, so a request waits at most for the pool connection timeout.

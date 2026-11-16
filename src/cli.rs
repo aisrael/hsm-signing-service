@@ -16,6 +16,7 @@ use tokio::signal::unix::signal;
 use tokio::sync::oneshot;
 use tracing_subscriber::fmt::format::FmtSpan;
 
+use crate::algorithm::Algorithm;
 use crate::api;
 use crate::api::BASE64;
 use crate::app_state::AppState;
@@ -116,7 +117,7 @@ fn do_verify(key_id: &str, signature: &str) {
     });
 
     let valid = hsm_backend
-        .verify(key_id, &payload, &signature)
+        .verify(key_id, Algorithm::EcdsaP256Sha256, &payload, &signature)
         .unwrap_or_else(|err| {
             eprintln!("Error verifying the signature: {err}");
             std::process::exit(1);
