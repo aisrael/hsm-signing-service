@@ -248,7 +248,7 @@ cargo bench --bench criterion_benchmark -- --baseline before
 
 - SoftHSM may do signing one call at a time inside the library, so a bigger session pool may not raise throughput. We have not proven where the bottleneck is.
 - The service cannot scale itself. It has no metrics endpoint, so an autoscaler has no signal to use. With SoftHSM, you also cannot add instances, because one token volume serves one instance.
-- The recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)) ran on a busy machine. It does not count `503` and `504` errors separately.
+- The recorded benchmark (see [docs/benchmarks.md](docs/benchmarks.md)) ran once for each configuration, on a machine that was not fully quiet. It does not count `503` and `504` errors separately, and it uses only `ECDSA_P256_SHA256`.
 - CI runs only the unit tests and skips the tests that need a token. It does not build the container image.
 
 ## Production considerations
